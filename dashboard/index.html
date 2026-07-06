@@ -1,0 +1,569 @@
+<title>Claude Deck</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link id="favicon" rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cg stroke='%23C96442' stroke-width='1.6' stroke-linecap='round'%3E%3Cline x1='12' y1='12' x2='12' y2='2.2'/%3E%3Cline x1='12' y1='12' x2='16.6' y2='3.6'/%3E%3Cline x1='12' y1='12' x2='19.8' y2='7'/%3E%3Cline x1='12' y1='12' x2='21.6' y2='11.6'/%3E%3Cline x1='12' y1='12' x2='20.6' y2='16.4'/%3E%3Cline x1='12' y1='12' x2='17.4' y2='20.2'/%3E%3Cline x1='12' y1='12' x2='12.4' y2='21.8'/%3E%3Cline x1='12' y1='12' x2='7.2' y2='20.6'/%3E%3Cline x1='12' y1='12' x2='3.6' y2='17'/%3E%3Cline x1='12' y1='12' x2='2.2' y2='12.4'/%3E%3Cline x1='12' y1='12' x2='3.2' y2='7.4'/%3E%3Cline x1='12' y1='12' x2='7.6' y2='3.2'/%3E%3C/g%3E%3C/svg%3E" />
+<style>
+  :root {
+    --bg: #FAF9F5;
+    --card: #FFFFFF;
+    --text: #191919;
+    --muted: #6E6C64;
+    --border: #E8E6DC;
+    --accent: #C96442;
+    --accent-hover: #B55535;
+    --accent-fg: #FFFFFF;
+    --amber: #D97706;
+    --red: #DC2626;
+    --green: #2F9E44;
+    --track: #ECE9DF;
+    --shimmer: rgba(25, 25, 25, 0.06);
+    --serif: 'Tiempos Text', ui-serif, Georgia, 'Times New Roman', serif;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #262624;
+      --card: #30302E;
+      --text: #ECEAE4;
+      --muted: #A29F96;
+      --border: #3F3E3A;
+      --accent: #D97757;
+      --accent-hover: #E28866;
+      --accent-fg: #262624;
+      --track: #3F3E3A;
+      --shimmer: rgba(236, 234, 228, 0.06);
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #FAF9F5;
+    --card: #FFFFFF;
+    --text: #191919;
+    --muted: #6E6C64;
+    --border: #E8E6DC;
+    --accent: #C96442;
+    --accent-hover: #B55535;
+    --accent-fg: #FFFFFF;
+    --track: #ECE9DF;
+    --shimmer: rgba(25, 25, 25, 0.06);
+  }
+  :root[data-theme="dark"] {
+    --bg: #262624;
+    --card: #30302E;
+    --text: #ECEAE4;
+    --muted: #A29F96;
+    --border: #3F3E3A;
+    --accent: #D97757;
+    --accent-hover: #E28866;
+    --accent-fg: #262624;
+    --track: #3F3E3A;
+    --shimmer: rgba(236, 234, 228, 0.06);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+  }
+  body { min-height: 100vh; }
+  a { color: inherit; }
+
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 24px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
+  .mark { flex-shrink: 0; color: var(--accent); }
+  .wordmark {
+    font-family: var(--serif);
+    font-weight: 600;
+    font-size: 17px;
+    letter-spacing: -0.015em;
+    color: var(--text);
+  }
+  .count {
+    font-size: 12px;
+    color: var(--muted);
+    background: transparent;
+    border: 1px solid var(--border);
+    padding: 2px 9px;
+    border-radius: 999px;
+  }
+  .spacer { flex: 1; }
+  .updated { font-size: 12px; color: var(--muted); margin-right: 4px; font-variant-numeric: tabular-nums; }
+  button.refresh {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--accent);
+    padding: 6px 14px;
+    border-radius: 999px;
+    font-size: 13px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease;
+  }
+  button.refresh:hover { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+  button.refresh svg { transition: transform 0.5s ease; }
+  button.refresh.spinning svg { transform: rotate(360deg); }
+
+  main { max-width: 1160px; margin: 0 auto; padding: 28px 24px 60px; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+    gap: 16px;
+  }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    transition: border-color 150ms ease, transform 150ms ease;
+  }
+  .card:hover {
+    border-color: var(--muted);
+    transform: translateY(-1px);
+  }
+  .card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .name-wrap { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .name {
+    font-family: var(--serif);
+    font-weight: 500;
+    font-size: 17.5px;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #B8B5AA;
+    flex-shrink: 0;
+  }
+  .dot.running {
+    background: var(--green);
+    animation: pulse 1.8s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(47, 158, 68, 0.4); }
+    50% { box-shadow: 0 0 0 5px rgba(47, 158, 68, 0); }
+  }
+  button.open {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border: 1px solid var(--accent);
+    padding: 6px 16px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+    flex-shrink: 0;
+    transition: background-color 150ms ease, border-color 150ms ease;
+  }
+  button.open:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  button.open:active { filter: brightness(0.96); }
+  button.open.focus {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+  }
+  button.open.focus:hover { background: var(--accent); color: var(--accent-fg); }
+
+  .windows { display: flex; flex-direction: column; gap: 10px; }
+  .window-row { display: flex; flex-direction: column; gap: 4px; }
+  .window-label-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+  }
+  .window-label { color: var(--text); }
+  .window-pct { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .track {
+    height: 6px;
+    border-radius: 3px;
+    background: var(--track);
+    overflow: hidden;
+  }
+  .fill {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--accent);
+    transition: width 300ms ease;
+  }
+  .fill.warn { background: var(--amber); }
+  .fill.danger { background: var(--red); }
+  .resets { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .error-state {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .error-state svg { flex-shrink: 0; color: var(--accent); margin-top: 1px; }
+  .error-state .msg { color: var(--text); font-weight: 500; margin-bottom: 2px; }
+  .error-state .hint { font-size: 12px; }
+
+  .skeleton { position: relative; overflow: hidden; }
+  .skeleton .bar {
+    height: 10px;
+    border-radius: 6px;
+    background: var(--shimmer);
+    margin-bottom: 10px;
+  }
+  .skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, var(--shimmer), transparent);
+    animation: shimmer 1.4s infinite;
+  }
+  @keyframes shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+
+  .empty {
+    max-width: 480px;
+    margin: 60px auto;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 36px 32px;
+    text-align: center;
+  }
+  .empty h2 { margin: 0 0 8px; font-family: var(--serif); font-weight: 600; font-size: 19px; }
+  .empty p.lead { color: var(--muted); font-size: 13.5px; margin: 0 0 20px; }
+  .steps { list-style: none; margin: 0; padding: 0; text-align: left; display: flex; flex-direction: column; gap: 14px; }
+  .steps li { display: flex; gap: 12px; align-items: flex-start; }
+  .step-num {
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: transparent;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--sans);
+  }
+  .steps code {
+    background: var(--track);
+    padding: 1px 6px;
+    border-radius: 5px;
+    font-size: 12.5px;
+  }
+  .steps span { font-size: 13.5px; padding-top: 2px; }
+
+  footer {
+    text-align: center;
+    color: var(--muted);
+    font-size: 12px;
+    padding: 24px;
+  }
+</style>
+
+<header>
+  <svg class="mark" width="23" height="23" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <g stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+      <line x1="12" y1="12" x2="12" y2="2.2"/>
+      <line x1="12" y1="12" x2="16.6" y2="3.6"/>
+      <line x1="12" y1="12" x2="19.8" y2="7"/>
+      <line x1="12" y1="12" x2="21.6" y2="11.6"/>
+      <line x1="12" y1="12" x2="20.6" y2="16.4"/>
+      <line x1="12" y1="12" x2="17.4" y2="20.2"/>
+      <line x1="12" y1="12" x2="12.4" y2="21.8"/>
+      <line x1="12" y1="12" x2="7.2" y2="20.6"/>
+      <line x1="12" y1="12" x2="3.6" y2="17"/>
+      <line x1="12" y1="12" x2="2.2" y2="12.4"/>
+      <line x1="12" y1="12" x2="3.2" y2="7.4"/>
+      <line x1="12" y1="12" x2="7.6" y2="3.2"/>
+    </g>
+  </svg>
+  <span class="wordmark">Claude Deck</span>
+  <span class="count" id="count">0 accounts</span>
+  <div class="spacer"></div>
+  <span class="updated" id="updated">updated just now</span>
+  <button class="refresh" id="refresh-btn">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M21 12a9 9 0 1 1-3-6.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      <path d="M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    Refresh
+  </button>
+</header>
+
+<main>
+  <div id="content">
+    <div class="grid" id="grid"></div>
+  </div>
+</main>
+
+<footer>Unofficial. Not affiliated with Anthropic. Data stays on this Mac.</footer>
+
+<script>
+(function () {
+  var params = new URLSearchParams(location.search);
+  var theme = params.get('theme');
+  if (theme === 'light' || theme === 'dark') {
+    document.documentElement.dataset.theme = theme;
+  }
+})();
+
+(function () {
+  var state = { profiles: [], usage: {}, fetchedAt: null, loading: true };
+  var lastFetchTime = null;
+
+  function el(tag, className, html) {
+    var e = document.createElement(tag);
+    if (className) e.className = className;
+    if (html != null) e.innerHTML = html;
+    return e;
+  }
+
+  function warningIcon() {
+    return '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+      '<path d="M10.3 3.9a2 2 0 0 1 3.4 0l8 14A2 2 0 0 1 20 21H4a2 2 0 0 1-1.7-3.1l8-14Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>' +
+      '<path d="M12 9v4M12 17h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+  }
+
+  function fmtRelative(iso) {
+    if (!iso) return '';
+    var diff = new Date(iso).getTime() - Date.now();
+    if (diff <= 0) return 'resets shortly';
+    var mins = Math.round(diff / 60000);
+    var h = Math.floor(mins / 60);
+    var m = mins % 60;
+    if (h >= 48) {
+      var d = Math.floor(h / 24);
+      var rh = h % 24;
+      return 'resets in ' + d + 'd ' + rh + 'h';
+    }
+    if (h <= 0) return 'resets in ' + m + 'm';
+    return 'resets in ' + h + 'h ' + m + 'm';
+  }
+
+  function fmtAgo(ms) {
+    var s = Math.round(ms / 1000);
+    if (s < 5) return 'updated just now';
+    if (s < 60) return 'updated ' + s + 's ago';
+    var m = Math.round(s / 60);
+    return 'updated ' + m + 'm ago';
+  }
+
+  function fillClass(pct) {
+    if (pct >= 90) return 'fill danger';
+    if (pct >= 70) return 'fill warn';
+    return 'fill';
+  }
+
+  function renderSkeletonCard() {
+    var card = el('div', 'card skeleton');
+    card.appendChild(el('div', 'bar', ''));
+    var b2 = el('div', 'bar', '');
+    b2.style.width = '70%';
+    card.appendChild(b2);
+    var b3 = el('div', 'bar', '');
+    b3.style.width = '85%';
+    card.appendChild(b3);
+    return card;
+  }
+
+  function renderCard(profile, usage) {
+    var card = el('div', 'card');
+    var head = el('div', 'card-head');
+    var nameWrap = el('div', 'name-wrap');
+    var running = usage ? usage.running : profile.running;
+    nameWrap.appendChild(el('span', 'dot' + (running ? ' running' : '')));
+    nameWrap.appendChild(el('span', 'name', profile.name));
+    head.appendChild(nameWrap);
+
+    var btn = el('button', 'open' + (running ? ' focus' : ''), running ? 'Focus' : 'Open');
+    btn.addEventListener('click', function () { openProfile(profile.name, btn); });
+    head.appendChild(btn);
+    card.appendChild(head);
+
+    if (!usage || usage.ok === undefined) {
+      card.appendChild(renderSkeletonCard().firstChild ? renderSkeletonCard() : el('div'));
+    } else if (!usage.ok) {
+      var errBox = el('div', 'error-state');
+      var iconWrap = el('div', '', warningIcon());
+      errBox.appendChild(iconWrap);
+      var textWrap = el('div');
+      textWrap.appendChild(el('div', 'msg', 'Could not load usage'));
+      textWrap.appendChild(el('div', 'hint', usage.error || 'unknown error'));
+      errBox.appendChild(textWrap);
+      card.appendChild(errBox);
+    } else {
+      var windows = el('div', 'windows');
+      (usage.windows || []).forEach(function (w) {
+        var row = el('div', 'window-row');
+        var labelRow = el('div', 'window-label-row');
+        labelRow.appendChild(el('span', 'window-label', w.label));
+        labelRow.appendChild(el('span', 'window-pct', w.utilization + '%'));
+        row.appendChild(labelRow);
+        var track = el('div', 'track');
+        var fill = el('div', fillClass(w.utilization));
+        fill.style.width = Math.min(100, Math.max(0, w.utilization)) + '%';
+        track.appendChild(fill);
+        row.appendChild(track);
+        if (w.resetsAt) {
+          var resets = el('div', 'resets');
+          resets.dataset.resetsAt = w.resetsAt;
+          resets.textContent = fmtRelative(w.resetsAt);
+          row.appendChild(resets);
+        }
+        windows.appendChild(row);
+      });
+      card.appendChild(windows);
+    }
+    return card;
+  }
+
+  function renderEmpty() {
+    var wrap = el('div', 'empty');
+    wrap.appendChild(el('h2', '', 'No profiles yet'));
+    wrap.appendChild(el('p', 'lead', 'Set up Claude Deck to run multiple accounts side by side.'));
+    var steps = el('ol', 'steps');
+    var items = [
+      'Run <code>claude-deck patch</code> to prepare Claude Desktop.',
+      'Run <code>claude-deck open work</code> and log in.',
+      'Usage appears here automatically.'
+    ];
+    items.forEach(function (html, i) {
+      var li = el('li');
+      li.appendChild(el('span', 'step-num', String(i + 1)));
+      li.appendChild(el('span', '', html));
+      steps.appendChild(li);
+    });
+    wrap.appendChild(steps);
+    return wrap;
+  }
+
+  function render() {
+    var grid = document.getElementById('grid');
+    var content = document.getElementById('content');
+    grid.innerHTML = '';
+
+    document.getElementById('count').textContent =
+      state.profiles.length + (state.profiles.length === 1 ? ' account' : ' accounts');
+
+    if (!state.loading && state.profiles.length === 0) {
+      content.innerHTML = '';
+      content.appendChild(renderEmpty());
+      return;
+    }
+    if (content.querySelector('.empty')) content.innerHTML = '<div class="grid" id="grid"></div>';
+    grid = document.getElementById('grid');
+    grid.innerHTML = '';
+
+    if (state.loading && state.profiles.length === 0) {
+      for (var i = 0; i < 3; i++) grid.appendChild(renderSkeletonCard());
+      return;
+    }
+
+    state.profiles.forEach(function (p) {
+      grid.appendChild(renderCard(p, state.usage[p.name]));
+    });
+  }
+
+  function tickUpdated() {
+    if (!lastFetchTime) return;
+    document.getElementById('updated').textContent = fmtAgo(Date.now() - lastFetchTime);
+  }
+
+  function tickResets() {
+    document.querySelectorAll('.resets[data-resets-at]').forEach(function (elm) {
+      elm.textContent = fmtRelative(elm.dataset.resetsAt);
+    });
+  }
+
+  function openProfile(name, btn) {
+    btn.disabled = true;
+    var original = btn.textContent;
+    btn.textContent = '...';
+    fetch('/api/open', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Claude-Deck': '1' },
+      body: JSON.stringify({ name: name })
+    }).then(function () {
+      btn.disabled = false;
+      btn.textContent = original;
+      setTimeout(loadProfiles, 1200);
+    }).catch(function () {
+      btn.disabled = false;
+      btn.textContent = original;
+    });
+  }
+
+  function loadProfiles() {
+    return fetch('/api/profiles').then(function (r) { return r.json(); }).then(function (data) {
+      state.profiles = data || [];
+      state.loading = false;
+      render();
+    }).catch(function () {
+      state.loading = false;
+      render();
+    });
+  }
+
+  function loadUsage(fresh) {
+    var url = '/api/usage' + (fresh ? '?fresh=1' : '');
+    return fetch(url).then(function (r) { return r.json(); }).then(function (data) {
+      var map = {};
+      (data.profiles || []).forEach(function (p) { map[p.name] = p; });
+      state.usage = map;
+      lastFetchTime = Date.now();
+      render();
+      tickUpdated();
+    });
+  }
+
+  function refreshAll(fresh) {
+    var btn = document.getElementById('refresh-btn');
+    btn.classList.add('spinning');
+    Promise.all([loadProfiles(), loadUsage(fresh)]).then(function () {
+      setTimeout(function () { btn.classList.remove('spinning'); }, 500);
+    }).catch(function () {
+      btn.classList.remove('spinning');
+    });
+  }
+
+  document.getElementById('refresh-btn').addEventListener('click', function () {
+    refreshAll(true);
+  });
+
+  refreshAll(false);
+  setInterval(function () { refreshAll(false); }, 5 * 60 * 1000);
+  setInterval(tickUpdated, 1000);
+  setInterval(tickResets, 30 * 1000);
+})();
+</script>
