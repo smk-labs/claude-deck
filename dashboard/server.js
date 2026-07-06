@@ -395,10 +395,14 @@ const MOCK_FIXTURES = [
         id: 'org-partnerz-2',
         name: 'Partnerz-2',
         plan: 'Team',
+        // Headroom trap: session is wide open (8%) and "All models" is fine
+        // (30%), but the scoped Fable limit is maxed at 100%. Proves the
+        // headroom predicate looks at EVERY weekly bucket, not just the
+        // all-models one. Amber tier fixture: weekly reset ~9h out.
         raw: {
           five_hour: { utilization: 8, resets_hrs: 4.4 },
-          // Amber tier fixture: weekly reset ~9h out (under 12h, 4h+).
           seven_day: { utilization: 30, resets_hrs: 9 },
+          seven_day_fable: { utilization: 100, resets_hrs: 9 },
         },
       },
       {

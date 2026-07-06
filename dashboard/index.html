@@ -576,6 +576,7 @@
   <div class="segmented" id="filter-segmented" role="group" aria-label="Filter profiles">
     <button type="button" data-filter="all">All</button>
     <button type="button" data-filter="available">Available now</button>
+    <button type="button" data-filter="headroom">Has headroom</button>
     <button type="button" data-filter="running">Running</button>
   </div>
   <div class="sort-control">
@@ -659,7 +660,7 @@
   var SORT_KEY = 'claude-deck-sort';
   var FILTER_KEY = 'claude-deck-filter';
   var VALID_SORTS = ['weekly-reset-soonest', 'session-used-asc', 'session-used-desc', 'weekly-used-asc', 'weekly-used-desc', 'name'];
-  var VALID_FILTERS = ['all', 'available', 'running'];
+  var VALID_FILTERS = ['all', 'available', 'headroom', 'running'];
 
   function loadPref(key, valid, fallback) {
     try {
@@ -932,6 +933,20 @@
     return (org.windows || []).filter(function (w) { return w.group === 'weekly'; });
   }
 
+  function orgMaxWeeklyUtilization(org) {
+    var weeklyWindows = orgWeeklyWindows(org);
+    if (!weeklyWindows.length) return 0;
+    return Math.max.apply(null, weeklyWindows.map(function (w) { return w.utilization; }));
+  }
+
+  // "Has headroom": not blocked on session, and not maxed on ANY weekly
+  // bucket (including a scoped per-model limit like Fable). This is the
+  // use-it-or-lose-it check: a maxed weekly bucket is dead weight even if
+  // the session window still has room.
+  function orgHasHeadroom(org) {
+    return orgSessionUtilization(org) < 90 && orgMaxWeeklyUtilization(org) < 100;
+  }
+
   // Derives sort/filter keys for a profile card across all its orgs.
   function cardMetrics(profile) {
     var usage = state.usage[profile.name];
@@ -942,7 +957,8 @@
       sessionMax: null,
       weeklyUsedMin: null,
       weeklyUsedMax: null,
-      availableNow: false
+      availableNow: false,
+      hasHeadroom: false
     };
     if (!m.hasData) return m;
 
@@ -953,6 +969,7 @@
       if (m.sessionMin === null || sessionPct < m.sessionMin) m.sessionMin = sessionPct;
       if (m.sessionMax === null || sessionPct > m.sessionMax) m.sessionMax = sessionPct;
       if (sessionPct < 90) m.availableNow = true;
+      if (orgHasHeadroom(org)) m.hasHeadroom = true;
 
       orgWeeklyWindows(org).forEach(function (w) {
         if (m.weeklyUsedMin === null || w.utilization < m.weeklyUsedMin) m.weeklyUsedMin = w.utilization;
@@ -977,6 +994,10 @@
       if (state.filter === 'available') {
         var m = cardMetrics(p);
         return m.hasData && m.availableNow;
+      }
+      if (state.filter === 'headroom') {
+        var mh = cardMetrics(p);
+        return mh.hasData && mh.hasHeadroom;
       }
       return true;
     });
@@ -1019,6 +1040,26 @@
     return indexed.map(function (x) { return x.p; });
   }
 
+  // Org passes the currently active filter, mirroring filterProfiles but at
+  // org granularity (a profile can have one org with headroom and another
+  // maxed out, so up-next needs a finer grain than the card-level filter).
+  function orgPassesActiveFilter(profile, org, sessionPct) {
+    switch (state.filter) {
+      case 'headroom':
+        return orgHasHeadroom(org);
+      case 'available':
+        return sessionPct < 90;
+      case 'running': {
+        var usage = state.usage[profile.name];
+        var running = usage ? usage.running : profile.running;
+        return !!running;
+      }
+      case 'all':
+      default:
+        return true;
+    }
+  }
+
   function buildUpNextCandidates() {
     var candidates = [];
     state.profiles.forEach(function (profile) {
@@ -1029,24 +1070,59 @@
         var weeklyWindows = orgWeeklyWindows(org);
         if (!weeklyWindows.length) return;
         var sessionPct = orgSessionUtilization(org);
-        if (sessionPct >= 90) return;
+        if (!orgPassesActiveFilter(profile, org, sessionPct)) return;
         var earliest = null;
         weeklyWindows.forEach(function (w) {
           if (!w.resetsAt) return;
           var t = new Date(w.resetsAt).getTime();
           if (earliest === null || t < earliest.t) earliest = { t: t, iso: w.resetsAt };
         });
-        if (!earliest) return;
         candidates.push({
           profile: profile,
           org: org,
           sessionPct: sessionPct,
-          resetsAt: earliest.iso,
-          resetsAtMs: earliest.t
+          maxWeeklyPct: orgMaxWeeklyUtilization(org),
+          resetsAt: earliest ? earliest.iso : null,
+          resetsAtMs: earliest ? earliest.t : null
         });
       });
     });
-    candidates.sort(function (a, b) { return a.resetsAtMs - b.resetsAtMs; });
+
+    candidates.sort(function (a, b) {
+      switch (state.sort) {
+        case 'session-used-asc':
+          return a.sessionPct - b.sessionPct;
+        case 'session-used-desc':
+          return b.sessionPct - a.sessionPct;
+        case 'weekly-used-asc':
+          return a.maxWeeklyPct - b.maxWeeklyPct;
+        case 'weekly-used-desc':
+          return b.maxWeeklyPct - a.maxWeeklyPct;
+        case 'name': {
+          var byName = (a.profile.name || '').localeCompare(b.profile.name || '');
+          if (byName !== 0) return byName;
+          return (a.org.name || '').localeCompare(b.org.name || '');
+        }
+        case 'weekly-reset-soonest':
+        default: {
+          // Nulls (no weekly resetsAt) sort last regardless of sort mode.
+          var ar = a.resetsAtMs === null ? Infinity : a.resetsAtMs;
+          var br = b.resetsAtMs === null ? Infinity : b.resetsAtMs;
+          return ar - br;
+        }
+      }
+    });
+
+    // Non-reset sorts can still leave null-reset candidates interleaved;
+    // push them to the end so "no data to show a reset for" never wins a
+    // top-3 slot over a candidate with an actual countdown.
+    candidates.sort(function (a, b) {
+      var aNull = a.resetsAtMs === null;
+      var bNull = b.resetsAtMs === null;
+      if (aNull === bNull) return 0;
+      return aNull ? 1 : -1;
+    });
+
     return candidates.slice(0, 3);
   }
 
