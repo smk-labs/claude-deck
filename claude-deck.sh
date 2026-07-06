@@ -933,7 +933,11 @@ safeRun(function () {
 safeRun(function () {
   if (!PROFILE) return;
   var shared = path.join(app.getPath('appData'), 'Claude', 'claude-code-sessions');
-  var mine = path.join(base, 'claude-code-sessions');
+  // Recompute the profile dir here: 'base' in the userData block above is
+  // function-scoped to its own safeRun callback and is NOT visible here.
+  // Referencing it threw a silent ReferenceError and made this whole block
+  // a no-op (real bug, caught in production on 2026-07-06).
+  var mine = path.join(app.getPath('appData'), 'Claude Profiles', PROFILE, 'claude-code-sessions');
 
   safeRun(function () { fs.mkdirSync(shared, { recursive: true }); });
 
