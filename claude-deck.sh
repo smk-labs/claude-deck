@@ -1444,6 +1444,20 @@ cmd_doctor() {
   step "Checking installed patch freshness..."
   _doctor_check_injection_freshness
 
+  # Warn when the installed copy (what the 'claude-deck' alias runs) has
+  # fallen behind the checkout it was installed from (classic after a
+  # git pull without re-running install).
+  if [ -f "$STATE_DIR/source-path" ]; then
+    local _src
+    _src="$(cat "$STATE_DIR/source-path" 2>/dev/null)"
+    if [ -n "$_src" ] && [ -f "$_src" ] && [ -f "$CANONICAL_PATH" ] \
+       && [ "$_src" != "$CANONICAL_PATH" ] && ! cmp -s "$_src" "$CANONICAL_PATH"; then
+      c_yellow "Installed copy differs from your checkout at:"
+      c_yellow "  $_src"
+      c_yellow "Run '$_src install' to refresh, then 'claude-deck patch --force'."
+    fi
+  fi
+
   local sync_script="$HOME/.claude/scripts/claude-sync.sh"
   if [ -f "$sync_script" ]; then
     if pgrep -x "Claude" >/dev/null 2>&1; then
@@ -1479,6 +1493,9 @@ cmd_install() {
     step "Installing script → $CANONICAL_PATH"
     cp -f "$SOURCE_PATH" "$CANONICAL_PATH"
     chmod 755 "$CANONICAL_PATH"
+    # Remember where we were installed from, so doctor can warn when the
+    # installed copy falls behind the checkout after a git pull.
+    printf '%s\n' "$SOURCE_PATH" > "$STATE_DIR/source-path" 2>/dev/null || true
     if [ -d "$SOURCE_DIR/dashboard" ]; then
       step "Copying dashboard/ → $CANONICAL_DIR/dashboard"
       rm -rf "$CANONICAL_DIR/dashboard"
