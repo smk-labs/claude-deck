@@ -17,6 +17,8 @@
     --track: #E9E7E1;
     --shimmer: rgba(25, 25, 25, 0.06);
     --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --urgent-critical: #DC2626;
+    --urgent-warning: #D97706;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -31,6 +33,8 @@
       --accent-fg: #FFFFFF;
       --track: #3F3E3A;
       --shimmer: rgba(236, 234, 228, 0.06);
+      --urgent-critical: #EF4444;
+      --urgent-warning: #F59E0B;
     }
   }
   :root[data-theme="light"] {
@@ -45,6 +49,8 @@
     --accent-fg: #FFFFFF;
     --track: #E9E7E1;
     --shimmer: rgba(25, 25, 25, 0.06);
+    --urgent-critical: #DC2626;
+    --urgent-warning: #D97706;
   }
   :root[data-theme="dark"] {
     --bg: #262624;
@@ -58,6 +64,8 @@
     --accent-fg: #FFFFFF;
     --track: #3F3E3A;
     --shimmer: rgba(236, 234, 228, 0.06);
+    --urgent-critical: #EF4444;
+    --urgent-warning: #F59E0B;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -243,6 +251,12 @@
   }
   .upnext-pill:hover { border-color: var(--muted); transform: translateY(-1px); }
   .upnext-pill.top-pick { border-color: var(--accent); }
+  .upnext-pill.tier-warning { border-color: var(--urgent-warning); }
+  .upnext-pill.tier-critical { border-color: var(--urgent-critical); }
+  .upnext-who.tier-warning-text { font-weight: 600; }
+  .upnext-who.tier-critical-text { font-weight: 600; }
+  .upnext-meta.tier-warning-text { color: var(--urgent-warning); }
+  .upnext-meta.tier-critical-text { color: var(--urgent-critical); }
   .upnext-badge {
     flex-shrink: 0;
     width: 22px;
@@ -723,6 +737,36 @@
     return group === 'session' ? fmtResetSession(iso) : fmtResetAbsolute(iso);
   }
 
+  // Up-next pills: time LEFT until weekly reset (use-it-or-lose-it framing),
+  // not the absolute clock time. Minutes only under 1h, "Xh Ym" under 48h,
+  // "Xd Yh" at 48h+.
+  function fmtRemaining(iso) {
+    if (!iso) return '';
+    var diff = new Date(iso).getTime() - Date.now();
+    if (diff <= 0) return 'Resetting now';
+    var totalMins = Math.round(diff / 60000);
+    var days = Math.floor(totalMins / 1440);
+    var hoursPart = Math.floor((totalMins % 1440) / 60);
+    var minsPart = totalMins % 60;
+    if (totalMins < 60) return minsPart + 'm left';
+    if (days >= 2) return days + 'd ' + hoursPart + 'h left';
+    var hours = Math.floor(totalMins / 60);
+    var mins = totalMins % 60;
+    return hours + 'h ' + mins + 'm left';
+  }
+
+  var URGENCY_CRITICAL_MS = 4 * 3600 * 1000;
+  var URGENCY_WARNING_MS = 12 * 3600 * 1000;
+
+  // Urgency tier from time remaining: 'critical' under 4h, 'warning' under
+  // 12h, 'default' otherwise. Drives the "use it or lose it" pill styling.
+  function urgencyTier(resetsAtMs) {
+    var diff = resetsAtMs - Date.now();
+    if (diff < URGENCY_CRITICAL_MS) return 'critical';
+    if (diff < URGENCY_WARNING_MS) return 'warning';
+    return 'default';
+  }
+
   function fmtAgo(ms) {
     var s = Math.round(ms / 1000);
     if (s < 60) return 'Last updated: less than a minute ago';
@@ -1024,13 +1068,22 @@
 
     wrap.style.display = '';
     candidates.forEach(function (c, i) {
-      var pill = el('button', 'upnext-pill' + (i === 0 ? ' top-pick' : ''));
+      var tier = urgencyTier(c.resetsAtMs);
+      // Urgency tiers take precedence over the top-pick accent: top-pick
+      // border only shows at the default (neutral/blue) tier.
+      var pillClass = 'upnext-pill';
+      if (tier === 'critical') pillClass += ' tier-critical';
+      else if (tier === 'warning') pillClass += ' tier-warning';
+      else if (i === 0) pillClass += ' top-pick';
+
+      var pill = el('button', pillClass);
       pill.type = 'button';
       pill.appendChild(el('span', 'upnext-badge', monogram(c.org.name)));
       var text = el('div', 'upnext-text');
-      text.appendChild(el('span', 'upnext-who', c.profile.name + ' · ' + (c.org.name || 'Unknown org')));
-      var meta = fmtResetAbsolute(c.resetsAt) + ' · ' + c.sessionPct + '% session';
-      text.appendChild(el('span', 'upnext-meta', meta));
+      var whoClass = 'upnext-who' + (tier !== 'default' ? ' tier-' + tier + '-text' : '');
+      text.appendChild(el('span', whoClass, c.profile.name + ' · ' + (c.org.name || 'Unknown org')));
+      var metaClass = 'upnext-meta' + (tier !== 'default' ? ' tier-' + tier + '-text' : '');
+      text.appendChild(el('span', metaClass, fmtRemaining(c.resetsAt) + ' · ' + c.sessionPct + '% session'));
       pill.appendChild(text);
       pill.addEventListener('click', function () { openProfile(c.profile.name, pill); });
       row.appendChild(pill);
@@ -1093,6 +1146,8 @@
     document.querySelectorAll('.resets[data-resets-at]').forEach(function (elm) {
       elm.textContent = fmtResetFor(elm.dataset.group, elm.dataset.resetsAt);
     });
+    // Full re-render (not just text) so urgency tiers advance as time passes.
+    renderUpNext();
   }
 
   function openProfile(name, btn) {

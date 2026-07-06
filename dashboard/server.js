@@ -323,7 +323,8 @@ const MOCK_FIXTURES = [
         plan: 'Team',
         raw: {
           five_hour: { utilization: 8, resets_hrs: 4.4 },
-          seven_day: { utilization: 30, resets_hrs: 120 },
+          // Amber tier fixture: weekly reset ~9h out (under 12h, 4h+).
+          seven_day: { utilization: 30, resets_hrs: 9 },
         },
       },
       {
@@ -351,7 +352,8 @@ const MOCK_FIXTURES = [
         plan: 'Pro',
         raw: {
           five_hour: { utilization: 12, resets_hrs: 4.5 },
-          seven_day: { utilization: 22, resets_hrs: 150 },
+          // Default (neutral) tier fixture: weekly reset ~2d out (48h+).
+          seven_day: { utilization: 22, resets_hrs: 48 },
         },
       },
     ],
@@ -367,8 +369,9 @@ const MOCK_FIXTURES = [
         plan: null,
         raw: {
           five_hour: { utilization: 5, resets_hrs: 1.1 },
-          seven_day: { utilization: 15, resets_hrs: 20 },
-          seven_day_sonnet: { utilization: 15, resets_hrs: 20 },
+          // Red tier fixture: weekly reset ~3h out (under 4h, use-it-or-lose-it).
+          seven_day: { utilization: 15, resets_hrs: 3 },
+          seven_day_sonnet: { utilization: 15, resets_hrs: 3 },
           // A wholly new, unrecognized top-level bucket outside the seven_day_* family.
           monthly_extra: { utilization: 3, resets_hrs: 400 },
         },
