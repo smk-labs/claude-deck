@@ -261,8 +261,46 @@ async function ensureAccount(name, profile) {
   return { orgs, email };
 }
 
-// Scans one level of an object for { utilization: number } entries and turns
-// them into windows. Order follows Object.keys insertion order (payload order).
+// The modern /usage payload carries a canonical `limits` array: exactly the
+// rows the Claude app itself renders. Each entry:
+//   { kind, group, percent, severity, resets_at, is_active,
+//     scope: { model: { display_name }, surface } }
+// We prefer it verbatim. It is the ground truth (confirmed against the live
+// API): a scoped per-model weekly limit like "Fable" appears ONLY here, as
+// kind "weekly_scoped" with scope.model.display_name, never as a flat key.
+function windowsFromLimits(limits) {
+  const out = [];
+  for (const lim of limits) {
+    if (!lim || typeof lim !== 'object') continue;
+    if (typeof lim.percent !== 'number') continue;
+    out.push({
+      id: lim.kind || 'limit',
+      label: labelForLimit(lim),
+      group: lim.group === 'session' || lim.group === 'weekly' ? lim.group : 'other',
+      utilization: lim.percent,
+      resetsAt: lim.resets_at || lim.resetsAt || null,
+    });
+  }
+  return out;
+}
+
+function labelForLimit(lim) {
+  if (lim.kind === 'session') return 'Current session';
+  if (lim.kind === 'weekly_all') return 'All models';
+  if (lim.kind === 'weekly_scoped') {
+    const model = lim.scope && lim.scope.model && lim.scope.model.display_name;
+    if (model) return model;
+    const surface = lim.scope && lim.scope.surface;
+    if (surface) return titleCase(String(surface));
+    return 'Weekly (scoped)';
+  }
+  return titleCase(String(lim.kind || 'limit'));
+}
+
+// Legacy fallback for older payloads that lack `limits`. Scans flat top-level
+// keys for real quota objects. Skips dollar-denominated caps (extra-usage /
+// credit pools like `amber_ladder`, which carry limit_dollars and are NOT the
+// plan quotas the app shows) and null placeholder codename keys.
 function scanWindows(container) {
   const windows = [];
   if (!container || typeof container !== 'object') return windows;
@@ -270,6 +308,7 @@ function scanWindows(container) {
     const val = container[key];
     if (!val || typeof val !== 'object') continue;
     if (typeof val.utilization !== 'number') continue;
+    if (val.limit_dollars != null || val.used_dollars != null) continue;
     windows.push({
       id: key,
       label: labelFor(key),
@@ -284,10 +323,17 @@ function scanWindows(container) {
 const GROUP_ORDER = { session: 0, weekly: 1, other: 2 };
 
 function normalizeUsage(raw) {
-  let windows = scanWindows(raw);
-  // Nothing at top level: fall back to a plausible nested container.
-  if (windows.length === 0 && raw && typeof raw === 'object' && raw.usage) {
-    windows = scanWindows(raw.usage);
+  let windows = [];
+  // Preferred: the canonical limits array the app renders.
+  if (raw && typeof raw === 'object' && Array.isArray(raw.limits) && raw.limits.length > 0) {
+    windows = windowsFromLimits(raw.limits);
+  }
+  // Fallback: legacy flat keys (older app/API without `limits`).
+  if (windows.length === 0) {
+    windows = scanWindows(raw);
+    if (windows.length === 0 && raw && typeof raw === 'object' && raw.usage) {
+      windows = scanWindows(raw.usage);
+    }
   }
   // Stable sort: session first, then weekly (payload order), then others
   // (payload order). Array.prototype.sort is stable in Node >=18.
@@ -448,11 +494,26 @@ function mockUsage() {
       if (org.error) {
         return { id: org.id, name: org.name, plan: org.plan, ok: false, error: org.error };
       }
+      // Build the real dual shape: legacy flat keys AND the canonical `limits`
+      // array the live API returns (and the app renders). normalizeUsage
+      // prefers `limits`, so this exercises the primary path.
       const rawWithTimestamps = {};
+      const limits = [];
       for (const key of Object.keys(org.raw)) {
         const w = org.raw[key];
-        rawWithTimestamps[key] = { utilization: w.utilization, resets_at: hrs(w.resets_hrs) };
+        const resets_at = hrs(w.resets_hrs);
+        rawWithTimestamps[key] = { utilization: w.utilization, resets_at: resets_at };
+        if (key === 'five_hour') {
+          limits.push({ kind: 'session', group: 'session', percent: w.utilization, resets_at: resets_at });
+        } else if (key === 'seven_day') {
+          limits.push({ kind: 'weekly_all', group: 'weekly', percent: w.utilization, resets_at: resets_at });
+        } else if (key.indexOf('seven_day_') === 0) {
+          limits.push({ kind: 'weekly_scoped', group: 'weekly', percent: w.utilization, resets_at: resets_at, scope: { model: { display_name: titleCase(key.slice('seven_day_'.length)) } } });
+        } else {
+          limits.push({ kind: key, group: 'other', percent: w.utilization, resets_at: resets_at });
+        }
       }
+      rawWithTimestamps.limits = limits;
       const windows = normalizeUsage(rawWithTimestamps);
       return { id: org.id, name: org.name, plan: org.plan, ok: true, windows };
     });
