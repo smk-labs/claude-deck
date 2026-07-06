@@ -301,7 +301,7 @@ asar_unpacked_list() {
 # Primary strategy: an exact brace-glob of the original files' BASENAMES,
 # e.g. "{foo.node,spawn-helper}". @electron/asar's unpack matcher
 # (lib/asar.js, shouldUnpackPath) runs minimatch with {matchBase: true}
-# against each file's basename, not its full relative path — a brace-glob
+# against each file's basename, not its full relative path: a brace-glob
 # of full paths silently matches nothing (verified empirically: 0/9 files
 # reproduced). Basenames are therefore the correct "exact" primary, and in
 # practice unpacked native files have distinctive basenames so this is not
