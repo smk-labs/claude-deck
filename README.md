@@ -65,6 +65,16 @@ Open `http://localhost:8965` to see the dashboard.
 
 ---
 
+## Claude Code sessions across accounts
+
+Profiles share one Claude Code session index (it's symlinked into the default app's own index folder), so every profile of the **same** account sees the same session list instantly. No extra step needed.
+
+To see Claude Code sessions **across different accounts**, use the companion tool [claude-sync](https://github.com/smk-labs/claude-sync): start one throwaway Claude Code session in the new account first, then run claude-sync (or its auto watcher).
+
+> If you're updating claude-deck from an older version, run `claude-deck patch --force` once so this fix takes effect.
+
+---
+
 ## App updates remove the patch
 
 Your logins, profiles, and chat history all survive Claude updates: they live outside the app bundle, in `~/Library/Application Support/Claude Profiles/` and `~/.claude`. Only the patch itself is overwritten, because Claude's auto-updater replaces `app.asar` wholesale.

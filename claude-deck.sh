@@ -920,6 +920,84 @@ safeRun(function () {
   }
 });
 
+// 1b) Share one Claude Code session index across every profile. Claude
+//     Desktop keeps its Claude Code session list per-userData at
+//     <userData>/claude-code-sessions/<account-uuid>/<org-uuid>/local_*.json.
+//     Transcripts live in the shared ~/.claude/projects, but the app only
+//     lists sessions it finds in this per-profile index, so a second
+//     profile of the same account shows "no Code sessions" even though the
+//     transcripts are right there. Fix: symlink each profile's index dir at
+//     the default app's index dir, migrating any existing per-profile
+//     sessions in first so nothing is lost. Silent no-op on any failure:
+//     this must never block app launch, and never deletes data.
+safeRun(function () {
+  if (!PROFILE) return;
+  var shared = path.join(app.getPath('appData'), 'Claude', 'claude-code-sessions');
+  var mine = path.join(base, 'claude-code-sessions');
+
+  safeRun(function () { fs.mkdirSync(shared, { recursive: true }); });
+
+  var mineStat = null;
+  safeRun(function () { mineStat = fs.lstatSync(mine); });
+
+  if (mineStat && mineStat.isSymbolicLink()) {
+    return; // already linked, nothing to do
+  }
+
+  if (mineStat && mineStat.isDirectory()) {
+    // Existing per-profile index: migrate its contents into the shared dir
+    // additively (never overwrite a file already in shared), then keep the
+    // original around as a timestamped backup instead of deleting it.
+    safeRun(function () {
+      if (typeof fs.cpSync === 'function') {
+        try {
+          fs.cpSync(mine, shared, { recursive: true, force: false, errorOnExist: false });
+        } catch (e) {
+          copyRecursiveSkipExisting(mine, shared);
+        }
+      } else {
+        copyRecursiveSkipExisting(mine, shared);
+      }
+    });
+    safeRun(function () {
+      fs.renameSync(mine, mine + '.migrated-' + Date.now());
+    });
+    safeRun(function () {
+      fs.symlinkSync(shared, mine);
+    });
+    return;
+  }
+
+  if (!mineStat) {
+    // Nothing at all yet for this profile: just point it at the shared dir.
+    safeRun(function () { fs.symlinkSync(shared, mine); });
+  }
+});
+
+// Manual recursive copy that skips any file/dir already present at the
+// destination. Used only as a fallback when fs.cpSync is unavailable or
+// throws, so the shared-index migration above still completes.
+function copyRecursiveSkipExisting(srcDir, destDir) {
+  safeRun(function () {
+    fs.mkdirSync(destDir, { recursive: true });
+    var entries = fs.readdirSync(srcDir, { withFileTypes: true });
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i];
+      var srcPath = path.join(srcDir, entry.name);
+      var destPath = path.join(destDir, entry.name);
+      safeRun(function () {
+        if (entry.isDirectory()) {
+          copyRecursiveSkipExisting(srcPath, destPath);
+        } else if (entry.isFile()) {
+          if (!fs.existsSync(destPath)) {
+            fs.copyFileSync(srcPath, destPath);
+          }
+        }
+      });
+    }
+  });
+}
+
 // 2) Tag window titles with the profile name so Mission Control, Cmd+Tab,
 //    and launchers like Raycast can tell instances apart at a glance.
 safeRun(function () {
