@@ -1252,11 +1252,21 @@ cmd_open() {
   local name="${1:-}"
 
   if [ -z "$name" ] || [ "$name" = "default" ]; then
-    # Default profile: never use -n here. A second instance on the default
-    # profile's userData dir would corrupt it (two processes writing the
-    # same LevelDB/session store).
-    step "Opening Claude (default profile)..."
-    open -a "Claude"
+    if _profile_is_running "default"; then
+      # Default already running: just bring it forward. Never use -n on a
+      # running default, a second instance on the same userData dir would
+      # corrupt its LevelDB/session store.
+      step "Focusing Claude (default profile)..."
+      osascript -e 'tell application "Claude" to activate' 2>/dev/null || true
+    else
+      # Default NOT running: we must force a brand-new instance with -n.
+      # Plain "open -a Claude" would just activate whatever profiled instance
+      # is already running (macOS treats them all as the "Claude" app), so
+      # the default profile would never actually launch. -n is safe here
+      # precisely because default is not running: no two writers on one dir.
+      step "Opening Claude (default profile)..."
+      open -n -a "Claude"
+    fi
     return
   fi
 

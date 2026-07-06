@@ -712,7 +712,34 @@
     return [];
   }
   function savePins(list) {
+    // localStorage is a fast local cache; the server file is the source of
+    // truth (survives port changes, cache clears, and different browsers).
     try { localStorage.setItem(PINS_KEY, JSON.stringify(list)); } catch (e) { /* ignore */ }
+    try {
+      fetch('/api/pins', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Claude-Deck': '1' },
+        body: JSON.stringify({ pins: list })
+      }).catch(function () { /* offline: localStorage still holds it */ });
+    } catch (e) { /* ignore */ }
+  }
+  function loadServerPins() {
+    return fetch('/api/pins')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !Array.isArray(d.pins)) return;
+        // First run on this build: server file is empty but we still have
+        // localStorage pins from the old browser-only build. Migrate them up
+        // instead of letting the empty server clobber them.
+        if (d.pins.length === 0 && state.pins.length > 0) {
+          savePins(state.pins);
+          return;
+        }
+        state.pins = d.pins.filter(function (n) { return typeof n === 'string'; });
+        try { localStorage.setItem(PINS_KEY, JSON.stringify(state.pins)); } catch (e) { /* ignore */ }
+        render();
+      })
+      .catch(function () { /* offline: keep the localStorage-seeded pins */ });
   }
   function isPinned(name) { return state.pins.indexOf(name) !== -1; }
   function togglePin(name) {
@@ -1386,6 +1413,7 @@
     render();
   });
 
+  loadServerPins();
   refreshAll(false);
   setInterval(function () { refreshAll(false); }, 5 * 60 * 1000);
   setInterval(tickUpdated, 1000);

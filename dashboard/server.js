@@ -105,6 +105,36 @@ function validName(name) {
   return typeof name === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(name);
 }
 
+// Pins live server-side (~/.claude-deck/pins.json) rather than in the
+// browser's localStorage, which is keyed per origin: running the dashboard on
+// a different port (e.g. when 8965 is busy) would otherwise silently drop the
+// user's pins. A single file on the machine is the source of truth.
+const PINS_FILE = path.join(os.homedir(), '.claude-deck', 'pins.json');
+let MOCK_PINS = []; // in-memory pins for MOCK mode, so tests never touch real state
+
+function readPins() {
+  if (MOCK) return MOCK_PINS.slice();
+  var data = readJsonSafe(PINS_FILE);
+  var list = Array.isArray(data) ? data : data && Array.isArray(data.pins) ? data.pins : [];
+  return list.filter(validName);
+}
+
+function writePins(list) {
+  var clean = (Array.isArray(list) ? list : []).filter(validName);
+  // De-dupe, preserve order.
+  var seen = {};
+  var out = [];
+  clean.forEach(function (n) { if (!seen[n]) { seen[n] = 1; out.push(n); } });
+  if (MOCK) { MOCK_PINS = out; return out; }
+  try {
+    fs.mkdirSync(path.dirname(PINS_FILE), { recursive: true });
+    fs.writeFileSync(PINS_FILE, JSON.stringify({ pins: out }, null, 2));
+  } catch (e) {
+    // best effort
+  }
+  return out;
+}
+
 // Locates claude-deck.sh so handleOpen can shell out to `open <name>` and
 // pick up its self-healing session-index link (ensure_profile_index_link)
 // instead of only ever calling macOS `open` directly. Checked in priority
@@ -623,27 +653,27 @@ function handleOpen(req, res) {
       return;
     }
 
-    // Named profiles: prefer routing through claude-deck.sh's own `open`
-    // subcommand, so a dashboard-initiated launch self-heals the session-index
-    // symlink (ensure_profile_index_link) exactly like a CLI `claude-deck open`
-    // would, instead of depending solely on whatever's currently injected into
-    // the app bundle. Falls back to the direct `open` invocation (unchanged
-    // behavior) if no installed script can be found. The default profile
-    // never goes through the script: cmd_open's own default handling is just
-    // `open -a "Claude"`, identical to the fallback below, so there's nothing
-    // to gain and no reason to shell out for it.
-    if (name !== 'default') {
-      const script = findClaudeDeckScript();
-      if (script) {
-        return execFile('/bin/bash', [script, 'open', name], (err) => {
-          if (err) return sendJson(res, 500, { ok: false, error: 'failed to launch Claude' });
-          sendJson(res, 200, { ok: true });
-        });
-      }
+    // Prefer routing through claude-deck.sh's own `open` subcommand (for BOTH
+    // named profiles and default), so a dashboard-initiated launch reuses the
+    // exact CLI logic: self-heals the session-index symlink for named
+    // profiles, and forces a fresh instance for a not-running default. Falls
+    // back to a direct `open` if no installed script is found.
+    const script = findClaudeDeckScript();
+    if (script) {
+      return execFile('/bin/bash', [script, 'open', name], (err) => {
+        if (err) return sendJson(res, 500, { ok: false, error: 'failed to launch Claude' });
+        sendJson(res, 200, { ok: true });
+      });
     }
 
+    // Fallback (no script): reached only when the profile is NOT running (the
+    // running check above returned early). A not-running default still needs
+    // -n to force a new instance, otherwise `open -a Claude` just focuses
+    // whatever profiled instance is already up and default never launches.
     const args =
-      name === 'default' ? ['-a', 'Claude'] : ['-n', '-a', 'Claude', '--args', '--profile=' + name];
+      name === 'default'
+        ? ['-n', '-a', 'Claude']
+        : ['-n', '-a', 'Claude', '--args', '--profile=' + name];
     execFile('open', args, (err) => {
       if (err) return sendJson(res, 500, { ok: false, error: 'failed to launch Claude' });
       sendJson(res, 200, { ok: true });
@@ -697,6 +727,30 @@ const server = http.createServer((req, res) => {
     return handleUsage(req, res, url.searchParams).catch((e) =>
       sendJson(res, 500, { error: String(e.message || e) })
     );
+  }
+  if (req.method === 'GET' && url.pathname === '/api/pins') {
+    return sendJson(res, 200, { pins: readPins() });
+  }
+  if (req.method === 'POST' && url.pathname === '/api/pins') {
+    if (req.headers['x-claude-deck'] !== '1') {
+      return sendJson(res, 403, { ok: false, error: 'forbidden' });
+    }
+    let body = '';
+    let tooLarge = false;
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 8192) { tooLarge = true; req.destroy(); }
+    });
+    req.on('end', () => {
+      if (tooLarge) return sendJson(res, 413, { ok: false, error: 'body too large' });
+      let parsed;
+      try { parsed = JSON.parse(body || '{}'); } catch (e) {
+        return sendJson(res, 400, { ok: false, error: 'invalid JSON' });
+      }
+      const pins = writePins(parsed && parsed.pins);
+      sendJson(res, 200, { ok: true, pins });
+    });
+    return;
   }
   if (req.method === 'POST' && url.pathname === '/api/open') {
     // State-changing route: also require a custom header the dashboard page
