@@ -145,7 +145,7 @@
     justify-content: space-between;
     gap: 10px;
   }
-  .name-wrap { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .name-wrap { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
   .name {
     font-family: var(--serif);
     font-weight: 500;
@@ -154,6 +154,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .plan-chip {
+    font-size: 12px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-shrink: 1;
   }
   .dot {
     width: 7px;
@@ -192,24 +200,32 @@
   }
   button.open.focus:hover { background: var(--accent); color: var(--accent-fg); }
 
-  .windows { display: flex; flex-direction: column; gap: 10px; }
-  .window-row { display: flex; flex-direction: column; gap: 4px; }
+  .windows { display: flex; flex-direction: column; gap: 14px; }
+  .window-group { display: flex; flex-direction: column; gap: 10px; }
+  .group-heading {
+    font-size: 11.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
+  .window-row { display: flex; flex-direction: column; gap: 6px; }
   .window-label-row {
     display: flex;
     justify-content: space-between;
     font-size: 13px;
   }
   .window-label { color: var(--text); }
-  .window-pct { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .window-pct { color: var(--muted); font-variant-numeric: tabular-nums; }
   .track {
-    height: 6px;
-    border-radius: 3px;
+    height: 8px;
+    border-radius: 999px;
     background: var(--track);
     overflow: hidden;
   }
   .fill {
     height: 100%;
-    border-radius: 3px;
+    border-radius: 999px;
     background: var(--accent);
     transition: width 300ms ease;
   }
@@ -311,7 +327,7 @@
   <span class="wordmark">Claude Deck</span>
   <span class="count" id="count">0 accounts</span>
   <div class="spacer"></div>
-  <span class="updated" id="updated">updated just now</span>
+  <span class="updated" id="updated">Last updated: less than a minute ago</span>
   <button class="refresh" id="refresh-btn">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
       <path d="M21 12a9 9 0 1 1-3-6.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -355,28 +371,53 @@
       '<path d="M12 9v4M12 17h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
   }
 
-  function fmtRelative(iso) {
+  var WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  function fmtClock(d) {
+    var h = d.getHours();
+    var m = d.getMinutes();
+    var ampm = h >= 12 ? 'PM' : 'AM';
+    var h12 = h % 12;
+    if (h12 === 0) h12 = 12;
+    var mm = m < 10 ? '0' + m : String(m);
+    return h12 + ':' + mm + ' ' + ampm;
+  }
+
+  // Session windows (the app's "Current session"): relative countdown,
+  // e.g. "Resets in 2 hr 1 min" / "Resets in 41 min". No countdown seconds.
+  function fmtResetSession(iso) {
     if (!iso) return '';
     var diff = new Date(iso).getTime() - Date.now();
-    if (diff <= 0) return 'resets shortly';
+    if (diff <= 0) return 'Resets shortly';
     var mins = Math.round(diff / 60000);
     var h = Math.floor(mins / 60);
     var m = mins % 60;
-    if (h >= 48) {
-      var d = Math.floor(h / 24);
-      var rh = h % 24;
-      return 'resets in ' + d + 'd ' + rh + 'h';
+    if (h <= 0) return 'Resets in ' + m + ' min';
+    return 'Resets in ' + h + ' hr ' + m + ' min';
+  }
+
+  // Weekly/other windows: absolute local time, e.g. "Resets Fri 12:00 PM",
+  // or "Resets Jul 12" once more than 7 days out.
+  function fmtResetAbsolute(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    var diffDays = (d.getTime() - Date.now()) / 86400000;
+    if (diffDays > 7) {
+      return 'Resets ' + MONTHS[d.getMonth()] + ' ' + d.getDate();
     }
-    if (h <= 0) return 'resets in ' + m + 'm';
-    return 'resets in ' + h + 'h ' + m + 'm';
+    return 'Resets ' + WEEKDAYS[d.getDay()] + ' ' + fmtClock(d);
+  }
+
+  function fmtResetFor(group, iso) {
+    return group === 'session' ? fmtResetSession(iso) : fmtResetAbsolute(iso);
   }
 
   function fmtAgo(ms) {
     var s = Math.round(ms / 1000);
-    if (s < 5) return 'updated just now';
-    if (s < 60) return 'updated ' + s + 's ago';
+    if (s < 60) return 'Last updated: less than a minute ago';
     var m = Math.round(s / 60);
-    return 'updated ' + m + 'm ago';
+    return 'Last updated: ' + m + (m === 1 ? ' minute ago' : ' minutes ago');
   }
 
   function fillClass(pct) {
@@ -397,6 +438,29 @@
     return card;
   }
 
+  var GROUP_HEADINGS = { weekly: 'Weekly limits', other: 'Other limits' };
+
+  function renderWindowRow(w) {
+    var row = el('div', 'window-row');
+    var labelRow = el('div', 'window-label-row');
+    labelRow.appendChild(el('span', 'window-label', w.label));
+    labelRow.appendChild(el('span', 'window-pct', w.utilization + '% used'));
+    row.appendChild(labelRow);
+    var track = el('div', 'track');
+    var fill = el('div', fillClass(w.utilization));
+    fill.style.width = Math.min(100, Math.max(0, w.utilization)) + '%';
+    track.appendChild(fill);
+    row.appendChild(track);
+    if (w.resetsAt) {
+      var resets = el('div', 'resets');
+      resets.dataset.resetsAt = w.resetsAt;
+      resets.dataset.group = w.group;
+      resets.textContent = fmtResetFor(w.group, w.resetsAt);
+      row.appendChild(resets);
+    }
+    return row;
+  }
+
   function renderCard(profile, usage) {
     var card = el('div', 'card');
     var head = el('div', 'card-head');
@@ -404,6 +468,9 @@
     var running = usage ? usage.running : profile.running;
     nameWrap.appendChild(el('span', 'dot' + (running ? ' running' : '')));
     nameWrap.appendChild(el('span', 'name', profile.name));
+    if (usage && usage.plan) {
+      nameWrap.appendChild(el('span', 'plan-chip', usage.plan));
+    }
     head.appendChild(nameWrap);
 
     var btn = el('button', 'open' + (running ? ' focus' : ''), running ? 'Focus' : 'Open');
@@ -424,25 +491,23 @@
       card.appendChild(errBox);
     } else {
       var windows = el('div', 'windows');
-      (usage.windows || []).forEach(function (w) {
-        var row = el('div', 'window-row');
-        var labelRow = el('div', 'window-label-row');
-        labelRow.appendChild(el('span', 'window-label', w.label));
-        labelRow.appendChild(el('span', 'window-pct', w.utilization + '%'));
-        row.appendChild(labelRow);
-        var track = el('div', 'track');
-        var fill = el('div', fillClass(w.utilization));
-        fill.style.width = Math.min(100, Math.max(0, w.utilization)) + '%';
-        track.appendChild(fill);
-        row.appendChild(track);
-        if (w.resetsAt) {
-          var resets = el('div', 'resets');
-          resets.dataset.resetsAt = w.resetsAt;
-          resets.textContent = fmtRelative(w.resetsAt);
-          row.appendChild(resets);
-        }
-        windows.appendChild(row);
+      var all = usage.windows || [];
+      var sessionRows = all.filter(function (w) { return w.group === 'session'; });
+      var weeklyRows = all.filter(function (w) { return w.group === 'weekly'; });
+      var otherRows = all.filter(function (w) { return w.group !== 'session' && w.group !== 'weekly'; });
+
+      sessionRows.forEach(function (w) { windows.appendChild(renderWindowRow(w)); });
+
+      [['weekly', weeklyRows], ['other', otherRows]].forEach(function (pair) {
+        var groupKey = pair[0];
+        var rows = pair[1];
+        if (!rows.length) return;
+        var section = el('div', 'window-group');
+        section.appendChild(el('div', 'group-heading', GROUP_HEADINGS[groupKey]));
+        rows.forEach(function (w) { section.appendChild(renderWindowRow(w)); });
+        windows.appendChild(section);
       });
+
       card.appendChild(windows);
     }
     return card;
@@ -502,7 +567,7 @@
 
   function tickResets() {
     document.querySelectorAll('.resets[data-resets-at]').forEach(function (elm) {
-      elm.textContent = fmtRelative(elm.dataset.resetsAt);
+      elm.textContent = fmtResetFor(elm.dataset.group, elm.dataset.resetsAt);
     });
   }
 
