@@ -286,6 +286,30 @@
     font-variant-numeric: tabular-nums;
   }
 
+  .pinned {
+    max-width: 1160px;
+    margin: 0 auto;
+    padding: 18px 24px 0;
+  }
+  .pinned .grid { margin-top: 10px; }
+  .card-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  button.pin {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border-radius: 999px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    cursor: pointer;
+    transition: border-color 150ms ease, color 150ms ease, background-color 150ms ease;
+  }
+  button.pin:hover { border-color: var(--muted); color: var(--text); }
+  button.pin.pinned { color: var(--accent); border-color: var(--accent); }
+
   main { max-width: 1160px; margin: 0 auto; padding: 20px 24px 60px; }
 
   .grid {
@@ -597,6 +621,11 @@
   <div class="upnext-row" id="upnext-row"></div>
 </div>
 
+<div class="pinned" id="pinned" style="display:none;">
+  <div class="upnext-label">Pinned</div>
+  <div class="grid" id="pinned-grid"></div>
+</div>
+
 <main>
   <div id="content">
     <div class="grid" id="grid"></div>
@@ -659,6 +688,8 @@
 (function () {
   var SORT_KEY = 'claude-deck-sort';
   var FILTER_KEY = 'claude-deck-filter';
+  var PINS_KEY = 'claude-deck-pins';
+  var UP_NEXT_MAX = 10;
   var VALID_SORTS = ['weekly-reset-soonest', 'session-used-asc', 'session-used-desc', 'weekly-used-asc', 'weekly-used-desc', 'name'];
   var VALID_FILTERS = ['all', 'available', 'headroom', 'running'];
 
@@ -673,13 +704,33 @@
     try { localStorage.setItem(key, value); } catch (e) { /* localStorage unavailable */ }
   }
 
+  function loadPins() {
+    try {
+      var v = JSON.parse(localStorage.getItem(PINS_KEY));
+      if (Array.isArray(v)) return v.filter(function (n) { return typeof n === 'string'; });
+    } catch (e) { /* localStorage unavailable or bad JSON */ }
+    return [];
+  }
+  function savePins(list) {
+    try { localStorage.setItem(PINS_KEY, JSON.stringify(list)); } catch (e) { /* ignore */ }
+  }
+  function isPinned(name) { return state.pins.indexOf(name) !== -1; }
+  function togglePin(name) {
+    var i = state.pins.indexOf(name);
+    if (i === -1) state.pins.push(name);
+    else state.pins.splice(i, 1);
+    savePins(state.pins);
+    render();
+  }
+
   var state = {
     profiles: [],
     usage: {},
     fetchedAt: null,
     loading: true,
     sort: loadPref(SORT_KEY, VALID_SORTS, 'weekly-reset-soonest'),
-    filter: loadPref(FILTER_KEY, VALID_FILTERS, 'all')
+    filter: loadPref(FILTER_KEY, VALID_FILTERS, 'all'),
+    pins: loadPins()
   };
   var lastFetchTime = null;
 
@@ -694,6 +745,11 @@
     return '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
       '<path d="M10.3 3.9a2 2 0 0 1 3.4 0l8 14A2 2 0 0 1 20 21H4a2 2 0 0 1-1.7-3.1l8-14Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>' +
       '<path d="M12 9v4M12 17h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+  }
+
+  function pinIcon(filled) {
+    return '<svg width="15" height="15" viewBox="0 0 24 24" fill="' + (filled ? 'currentColor' : 'none') + '" xmlns="http://www.w3.org/2000/svg">' +
+      '<path d="M12 2l2.9 6.3 6.9.6-5.2 4.5 1.6 6.7L12 16.9 5.8 20.6l1.6-6.7L2.2 8.9l6.9-.6L12 2Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>';
   }
 
   var WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -871,9 +927,19 @@
     nameWrap.appendChild(nameCol);
     head.appendChild(nameWrap);
 
+    var actions = el('div', 'card-actions');
+    var pinned = isPinned(profile.name);
+    var pinBtn = el('button', 'pin' + (pinned ? ' pinned' : ''), pinIcon(pinned));
+    pinBtn.type = 'button';
+    pinBtn.title = pinned ? 'Unpin' : 'Pin to top';
+    pinBtn.setAttribute('aria-label', pinBtn.title);
+    pinBtn.addEventListener('click', function () { togglePin(profile.name); });
+    actions.appendChild(pinBtn);
+
     var btn = el('button', 'open' + (running ? ' focus' : ''), running ? 'Focus' : 'Open');
     btn.addEventListener('click', function () { openProfile(profile.name, btn); });
-    head.appendChild(btn);
+    actions.appendChild(btn);
+    head.appendChild(actions);
     card.appendChild(head);
 
     if (!usage || usage.ok === undefined) {
@@ -1123,7 +1189,7 @@
       return aNull ? 1 : -1;
     });
 
-    return candidates.slice(0, 3);
+    return candidates.slice(0, UP_NEXT_MAX);
   }
 
   function renderUpNext() {
@@ -1166,6 +1232,20 @@
     });
   }
 
+  function renderPinned() {
+    var wrap = document.getElementById('pinned');
+    var pg = document.getElementById('pinned-grid');
+    pg.innerHTML = '';
+    if (state.loading || !state.profiles.length) { wrap.style.display = 'none'; return; }
+    // Pinned always show, regardless of the active filter, in the selected
+    // sort order. That is the point of pinning: quick access to the accounts
+    // you care about even when the filter would otherwise hide them.
+    var pinnedProfiles = sortProfiles(state.profiles.filter(function (p) { return isPinned(p.name); }));
+    if (!pinnedProfiles.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    pinnedProfiles.forEach(function (p) { pg.appendChild(renderCard(p, state.usage[p.name])); });
+  }
+
   function render() {
     var grid = document.getElementById('grid');
     var content = document.getElementById('content');
@@ -1185,6 +1265,7 @@
     if (!state.loading && state.profiles.length === 0) {
       toolbar.style.display = 'none';
       renderUpNext();
+      renderPinned();
       content.innerHTML = '';
       content.appendChild(renderEmpty());
       return;
@@ -1196,12 +1277,18 @@
 
     if (state.loading && state.profiles.length === 0) {
       renderUpNext();
+      renderPinned();
       for (var i = 0; i < 3; i++) grid.appendChild(renderSkeletonCard());
       return;
     }
 
     renderUpNext();
-    var visible = sortProfiles(filterProfiles(state.profiles));
+    renderPinned();
+    // Pinned profiles float to their own row above; keep them out of the main
+    // grid so they are not shown twice.
+    var visible = sortProfiles(filterProfiles(state.profiles)).filter(function (p) {
+      return !isPinned(p.name);
+    });
     visible.forEach(function (p) {
       grid.appendChild(renderCard(p, state.usage[p.name]));
     });
