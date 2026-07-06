@@ -168,6 +168,7 @@
     gap: 10px;
   }
   .name-wrap { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  .name-col { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .name {
     font-family: var(--serif);
     font-weight: 500;
@@ -177,13 +178,12 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .plan-chip {
-    font-size: 12px;
+  .email {
+    font-size: 13px;
     color: var(--muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    flex-shrink: 1;
   }
   .dot {
     width: 7px;
@@ -222,6 +222,46 @@
   }
   button.open.focus:hover { background: var(--accent); color: var(--accent-fg); }
 
+  .orgs { display: flex; flex-direction: column; }
+  .org-block { padding: 14px 0; }
+  .org-block:first-child { padding-top: 2px; }
+  .org-block:last-child { padding-bottom: 0; }
+  .org-block + .org-block { border-top: 1px solid var(--border); }
+  .org-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .org-badge {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--track);
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    align-self: center;
+    font-family: var(--sans);
+  }
+  .org-name {
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .org-plan {
+    font-size: 13px;
+    color: var(--muted);
+    flex-shrink: 0;
+  }
   .windows { display: flex; flex-direction: column; gap: 14px; }
   .window-group { display: flex; flex-direction: column; gap: 10px; }
   .group-heading {
@@ -265,6 +305,15 @@
   .error-state svg { flex-shrink: 0; color: var(--accent); margin-top: 1px; }
   .error-state .msg { color: var(--text); font-weight: 500; margin-bottom: 2px; }
   .error-state .hint { font-size: 12px; }
+
+  .org-error {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+  .org-error svg { flex-shrink: 0; color: var(--accent); margin-top: 1px; width: 15px; height: 15px; }
 
   .skeleton { position: relative; overflow: hidden; }
   .skeleton .bar {
@@ -543,16 +592,60 @@
     return row;
   }
 
+  function monogram(name) {
+    return (name || '?').trim().charAt(0).toUpperCase();
+  }
+
+  function renderOrgBlock(org) {
+    var block = el('div', 'org-block');
+    var head = el('div', 'org-head');
+    head.appendChild(el('span', 'org-badge', monogram(org.name)));
+    head.appendChild(el('span', 'org-name', org.name || 'Unknown org'));
+    if (org.plan) head.appendChild(el('span', 'org-plan', org.plan));
+    block.appendChild(head);
+
+    if (!org.ok) {
+      var errBox = el('div', 'org-error');
+      errBox.appendChild(el('div', '', warningIcon()));
+      errBox.appendChild(el('span', '', org.error || 'Could not load usage'));
+      block.appendChild(errBox);
+      return block;
+    }
+
+    var windows = el('div', 'windows');
+    var all = org.windows || [];
+    var sessionRows = all.filter(function (w) { return w.group === 'session'; });
+    var weeklyRows = all.filter(function (w) { return w.group === 'weekly'; });
+    var otherRows = all.filter(function (w) { return w.group !== 'session' && w.group !== 'weekly'; });
+
+    sessionRows.forEach(function (w) { windows.appendChild(renderWindowRow(w)); });
+
+    [['weekly', weeklyRows], ['other', otherRows]].forEach(function (pair) {
+      var groupKey = pair[0];
+      var rows = pair[1];
+      if (!rows.length) return;
+      var section = el('div', 'window-group');
+      section.appendChild(el('div', 'group-heading', GROUP_HEADINGS[groupKey]));
+      rows.forEach(function (w) { section.appendChild(renderWindowRow(w)); });
+      windows.appendChild(section);
+    });
+
+    block.appendChild(windows);
+    return block;
+  }
+
   function renderCard(profile, usage) {
     var card = el('div', 'card');
     var head = el('div', 'card-head');
     var nameWrap = el('div', 'name-wrap');
     var running = usage ? usage.running : profile.running;
     nameWrap.appendChild(el('span', 'dot' + (running ? ' running' : '')));
-    nameWrap.appendChild(el('span', 'name', profile.name));
-    if (usage && usage.plan) {
-      nameWrap.appendChild(el('span', 'plan-chip', usage.plan));
+    var nameCol = el('div', 'name-col');
+    nameCol.appendChild(el('span', 'name', profile.name));
+    if (usage && usage.email) {
+      nameCol.appendChild(el('span', 'email', usage.email));
     }
+    nameWrap.appendChild(nameCol);
     head.appendChild(nameWrap);
 
     var btn = el('button', 'open' + (running ? ' focus' : ''), running ? 'Focus' : 'Open');
@@ -572,25 +665,10 @@
       errBox.appendChild(textWrap);
       card.appendChild(errBox);
     } else {
-      var windows = el('div', 'windows');
-      var all = usage.windows || [];
-      var sessionRows = all.filter(function (w) { return w.group === 'session'; });
-      var weeklyRows = all.filter(function (w) { return w.group === 'weekly'; });
-      var otherRows = all.filter(function (w) { return w.group !== 'session' && w.group !== 'weekly'; });
-
-      sessionRows.forEach(function (w) { windows.appendChild(renderWindowRow(w)); });
-
-      [['weekly', weeklyRows], ['other', otherRows]].forEach(function (pair) {
-        var groupKey = pair[0];
-        var rows = pair[1];
-        if (!rows.length) return;
-        var section = el('div', 'window-group');
-        section.appendChild(el('div', 'group-heading', GROUP_HEADINGS[groupKey]));
-        rows.forEach(function (w) { section.appendChild(renderWindowRow(w)); });
-        windows.appendChild(section);
-      });
-
-      card.appendChild(windows);
+      var orgsWrap = el('div', 'orgs');
+      var orgs = usage.orgs || [];
+      orgs.forEach(function (org) { orgsWrap.appendChild(renderOrgBlock(org)); });
+      card.appendChild(orgsWrap);
     }
     return card;
   }
@@ -620,8 +698,15 @@
     var content = document.getElementById('content');
     grid.innerHTML = '';
 
-    document.getElementById('count').textContent =
-      state.profiles.length + (state.profiles.length === 1 ? ' account' : ' accounts');
+    var accountCount = state.profiles.length;
+    var orgCount = 0;
+    Object.keys(state.usage).forEach(function (name) {
+      var u = state.usage[name];
+      if (u && u.ok && Array.isArray(u.orgs)) orgCount += u.orgs.length;
+    });
+    var countText = accountCount + (accountCount === 1 ? ' account' : ' accounts');
+    if (orgCount > accountCount) countText += ', ' + orgCount + ' orgs';
+    document.getElementById('count').textContent = countText;
 
     if (!state.loading && state.profiles.length === 0) {
       content.innerHTML = '';

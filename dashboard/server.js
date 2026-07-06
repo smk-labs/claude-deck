@@ -146,23 +146,91 @@ function fetchJson(url, cookie) {
   });
 }
 
-async function ensureOrgId(name, profile) {
-  if (profile.orgId) return { orgId: profile.orgId, plan: profile.plan || null };
-  const orgs = await fetchJson('https://claude.ai/api/organizations', profile.sessionKey);
-  const list = Array.isArray(orgs) ? orgs : [];
-  const chosen =
-    list.find((o) => Array.isArray(o.capabilities) && o.capabilities.includes('chat')) || list[0];
-  if (!chosen || !chosen.uuid) throw new Error('no organization found for this account');
-  const orgId = chosen.uuid;
-  const plan = planFor(chosen);
+const ORGS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+// Best-effort walk of the bootstrap payload looking for the account's email.
+// Defensive because the bootstrap shape isn't documented and can change:
+// null on any failure rather than throwing, since email is cosmetic (UI only).
+function findEmail(node, depth) {
+  if (!node || typeof node !== 'object' || depth > 6) return null;
+  for (const key of Object.keys(node)) {
+    const val = node[key];
+    if (typeof val === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val)) {
+      if (/email/i.test(key)) return val;
+    }
+  }
+  for (const key of Object.keys(node)) {
+    const val = node[key];
+    if (val && typeof val === 'object' && /account|user/i.test(key)) {
+      const found = findEmail(val, depth + 1);
+      if (found) return found;
+    }
+  }
+  for (const key of Object.keys(node)) {
+    const val = node[key];
+    if (val && typeof val === 'object') {
+      const found = findEmail(val, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+async function fetchEmail(sessionKey) {
+  try {
+    const bootstrap = await fetchJson('https://claude.ai/api/bootstrap', sessionKey);
+    return findEmail(bootstrap, 0);
+  } catch (e) {
+    return null;
+  }
+}
+
+// Replaces the old single-org ensureOrgId: a single login can belong to
+// several organizations (e.g. two Team orgs + a personal Max org), each with
+// its own independent usage pool, so every chat-capable org is kept.
+async function ensureAccount(name, profile) {
+  const cachedOrgs = Array.isArray(profile.orgs) ? profile.orgs : null;
+  const fetchedAt = profile.orgsFetchedAt ? new Date(profile.orgsFetchedAt).getTime() : 0;
+  const isFresh = cachedOrgs && cachedOrgs.length > 0 && Date.now() - fetchedAt < ORGS_MAX_AGE_MS;
+
+  if (isFresh) {
+    return { orgs: cachedOrgs, email: profile.email || null };
+  }
+
+  let orgs = cachedOrgs;
+  let email = profile.email || null;
+  try {
+    const rawOrgs = await fetchJson('https://claude.ai/api/organizations', profile.sessionKey);
+    const list = Array.isArray(rawOrgs) ? rawOrgs : [];
+    const chatCapable = list.filter(
+      (o) => !Array.isArray(o.capabilities) || o.capabilities.includes('chat')
+    );
+    const kept = chatCapable.length ? chatCapable : list;
+    orgs = kept
+      .filter((o) => o && o.uuid)
+      .map((o) => ({ id: o.uuid, name: o.name || o.uuid, plan: planFor(o) }));
+    if (!orgs.length) throw new Error('no organization found for this account');
+    email = await fetchEmail(profile.sessionKey);
+  } catch (e) {
+    // A failed refetch must not wipe a cached list: fall back to it if present.
+    if (cachedOrgs && cachedOrgs.length) {
+      return { orgs: cachedOrgs, email: profile.email || null };
+    }
+    throw e;
+  }
+
   // Re-read from disk right before writing: the injected app process may have
   // refreshed sessionKey concurrently, and merging into the stale `profile`
   // we read earlier would clobber that fresh key with the old one.
   const filePath = path.join(PROFILES_DIR, name + '.json');
   const current = readJsonSafe(filePath) || profile;
-  const merged = Object.assign({}, current, { orgId, plan });
+  const merged = Object.assign({}, current, {
+    orgs,
+    email,
+    orgsFetchedAt: new Date().toISOString(),
+  });
   writeProfileJson(name, merged);
-  return { orgId, plan };
+  return { orgs, email };
 }
 
 // Scans one level of an object for { utilization: number } entries and turns
@@ -200,20 +268,36 @@ function normalizeUsage(raw) {
   return windows;
 }
 
+async function fetchUsageForOrg(org, sessionKey) {
+  try {
+    const raw = await fetchJson(
+      'https://claude.ai/api/organizations/' + org.id + '/usage',
+      sessionKey
+    );
+    const windows = normalizeUsage(raw);
+    return { id: org.id, name: org.name, plan: org.plan, ok: true, windows };
+  } catch (e) {
+    return { id: org.id, name: org.name, plan: org.plan, ok: false, error: e.message };
+  }
+}
+
 async function fetchUsageForProfile(name, profile) {
-  const { orgId, plan } = await ensureOrgId(name, profile);
-  const raw = await fetchJson(
-    'https://claude.ai/api/organizations/' + orgId + '/usage',
-    profile.sessionKey
+  const { orgs, email } = await ensureAccount(name, profile);
+  const results = await Promise.allSettled(
+    orgs.map((org) => fetchUsageForOrg(org, profile.sessionKey))
   );
-  const windows = normalizeUsage(raw);
-  return { name, running: false, ok: true, plan, windows, raw };
+  const orgResults = results.map((r, i) => {
+    if (r.status === 'fulfilled') return r.value;
+    const org = orgs[i];
+    return { id: org.id, name: org.name, plan: org.plan, ok: false, error: String((r.reason && r.reason.message) || r.reason || 'unknown error') };
+  });
+  return { name, email, running: false, ok: true, orgs: orgResults };
 }
 
 // ---------- mock data ----------
 // Believable fake fixtures for local dev / README screenshot (CLAUDE_DECK_MOCK=1).
 
-// Each fixture's `raw` mimics the shape the real /usage endpoint returns:
+// Each org's `raw` mimics the shape the real /usage endpoint returns:
 // a flat object of window-key -> { utilization, resets_at }. This is what
 // exercises the dynamic scan in normalizeUsage (fable + a novel future key
 // prove unknown buckets render without any code change).
@@ -221,56 +305,101 @@ const MOCK_FIXTURES = [
   {
     name: 'default',
     running: true,
-    plan: 'Max (20x)',
-    raw: {
-      five_hour: { utilization: 45, resets_hrs: 2.02 },
-      seven_day: { utilization: 15, resets_hrs: 96 },
-      seven_day_fable: { utilization: 17, resets_hrs: 96 },
-    },
-  },
-  {
-    name: 'work',
-    running: true,
-    plan: 'Max (20x)',
-    raw: {
-      five_hour: { utilization: 93, resets_hrs: 0.68 },
-      seven_day: { utilization: 81, resets_hrs: 40 },
-      seven_day_opus: { utilization: 76, resets_hrs: 40 },
-      // Novel, not-yet-announced bucket: proves unknown keys still render.
-      seven_day_haiku: { utilization: 9, resets_hrs: 40 },
-    },
+    email: 'claude.convi@partnerz.io',
+    orgs: [
+      {
+        id: 'org-partnerz',
+        name: 'Partnerz',
+        plan: 'Team',
+        raw: {
+          five_hour: { utilization: 45, resets_hrs: 2.02 },
+          seven_day: { utilization: 15, resets_hrs: 96 },
+          seven_day_fable: { utilization: 17, resets_hrs: 96 },
+        },
+      },
+      {
+        id: 'org-partnerz-2',
+        name: 'Partnerz-2',
+        plan: 'Team',
+        raw: {
+          five_hour: { utilization: 8, resets_hrs: 4.4 },
+          seven_day: { utilization: 30, resets_hrs: 120 },
+        },
+      },
+      {
+        id: 'org-personal',
+        name: 'Personal',
+        plan: 'Max',
+        raw: {
+          five_hour: { utilization: 93, resets_hrs: 0.68 },
+          seven_day: { utilization: 81, resets_hrs: 40 },
+          seven_day_opus: { utilization: 76, resets_hrs: 40 },
+          // Novel, not-yet-announced bucket: proves unknown keys still render.
+          seven_day_haiku: { utilization: 9, resets_hrs: 40 },
+        },
+      },
+    ],
   },
   {
     name: 'research',
     running: false,
-    plan: 'Pro',
-    raw: {
-      five_hour: { utilization: 12, resets_hrs: 4.5 },
-      seven_day: { utilization: 22, resets_hrs: 150 },
-    },
+    email: 'research@example.com',
+    orgs: [
+      {
+        id: 'org-research',
+        name: 'Research Co',
+        plan: 'Pro',
+        raw: {
+          five_hour: { utilization: 12, resets_hrs: 4.5 },
+          seven_day: { utilization: 22, resets_hrs: 150 },
+        },
+      },
+    ],
   },
   {
     name: 'client-a',
     running: false,
-    plan: null,
-    raw: {
-      five_hour: { utilization: 5, resets_hrs: 1.1 },
-      seven_day: { utilization: 15, resets_hrs: 20 },
-      seven_day_sonnet: { utilization: 15, resets_hrs: 20 },
-      // A wholly new, unrecognized top-level bucket outside the seven_day_* family.
-      monthly_extra: { utilization: 3, resets_hrs: 400 },
-    },
+    email: 'client-a@example.com',
+    orgs: [
+      {
+        id: 'org-client-a',
+        name: 'Client A',
+        plan: null,
+        raw: {
+          five_hour: { utilization: 5, resets_hrs: 1.1 },
+          seven_day: { utilization: 15, resets_hrs: 20 },
+          seven_day_sonnet: { utilization: 15, resets_hrs: 20 },
+          // A wholly new, unrecognized top-level bucket outside the seven_day_* family.
+          monthly_extra: { utilization: 3, resets_hrs: 400 },
+        },
+      },
+    ],
   },
   {
     name: 'client-b',
     running: false,
-    plan: 'Team',
-    raw: {
-      five_hour: { utilization: 68, resets_hrs: 3.25 },
-      seven_day: { utilization: 70, resets_hrs: 60 },
-    },
+    email: 'client-b@example.com',
+    // Multi-org profile where one org errors while the other still works:
+    // proves per-org error isolation (profile.ok stays true).
+    orgs: [
+      {
+        id: 'org-client-b-main',
+        name: 'Client B',
+        plan: 'Team',
+        raw: {
+          five_hour: { utilization: 68, resets_hrs: 3.25 },
+          seven_day: { utilization: 70, resets_hrs: 60 },
+        },
+      },
+      {
+        id: 'org-client-b-sandbox',
+        name: 'Client B Sandbox',
+        plan: 'Pro',
+        error: 'request failed with status 500',
+      },
+    ],
   },
-  { name: 'expired', running: false, plan: null, raw: null },
+  { name: 'expired', running: false, email: null, orgs: null },
 ];
 
 function mockProfiles() {
@@ -281,16 +410,22 @@ function mockProfiles() {
 function mockUsage() {
   const hrs = (h) => new Date(Date.now() + h * 3600 * 1000).toISOString();
   const profiles = MOCK_FIXTURES.map((f) => {
-    if (!f.raw) {
-      return { name: f.name, running: f.running, ok: false, error: 'session key expired: open this profile once and it refreshes automatically' };
+    if (!f.orgs) {
+      return { name: f.name, email: f.email, running: f.running, ok: false, error: 'session key expired: open this profile once and it refreshes automatically' };
     }
-    const rawWithTimestamps = {};
-    for (const key of Object.keys(f.raw)) {
-      const w = f.raw[key];
-      rawWithTimestamps[key] = { utilization: w.utilization, resets_at: hrs(w.resets_hrs) };
-    }
-    const windows = normalizeUsage(rawWithTimestamps);
-    return { name: f.name, running: f.running, ok: true, plan: f.plan, windows };
+    const orgs = f.orgs.map((org) => {
+      if (org.error) {
+        return { id: org.id, name: org.name, plan: org.plan, ok: false, error: org.error };
+      }
+      const rawWithTimestamps = {};
+      for (const key of Object.keys(org.raw)) {
+        const w = org.raw[key];
+        rawWithTimestamps[key] = { utilization: w.utilization, resets_at: hrs(w.resets_hrs) };
+      }
+      const windows = normalizeUsage(rawWithTimestamps);
+      return { id: org.id, name: org.name, plan: org.plan, ok: true, windows };
+    });
+    return { name: f.name, email: f.email, running: f.running, ok: true, orgs: orgs };
   });
   return { fetchedAt: new Date().toISOString(), profiles };
 }

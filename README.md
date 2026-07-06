@@ -14,7 +14,7 @@
 
 - **Unlimited simultaneous logins from one app copy.** No duplicate 700MB Claude.app bundles per account.
 - **Every profile shares the same `~/.claude`.** Claude Code sessions, config, and settings are identical across every account you log into.
-- **A local dashboard** rendering usage windows dynamically from whatever the API returns, so new model buckets (like a Fable weekly limit) show up automatically with no code change, with one-click open or focus per profile.
+- **A local dashboard** showing usage per account AND per organization (an account in several orgs gets one section per org), rendering usage windows dynamically from whatever the API returns, so new model buckets (like a Fable weekly limit) show up automatically with no code change, with one-click open or focus per profile.
 - **Window titles tagged `[profile]`** so Cmd-backtick, Mission Control, and Raycast can tell your accounts apart.
 
 ---
