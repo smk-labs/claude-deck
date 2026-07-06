@@ -40,6 +40,7 @@ Open `http://localhost:8965` to see the dashboard.
 |---|---|
 | `claude-deck patch` | Apply the patch. Idempotent, safe to re-run. |
 | `claude-deck patch --force` | Re-apply even if already patched. |
+| `claude-deck patch --verify-launch` | (dev/testing only, requires `--app <scratch-copy>`) Launch the patched app and confirm it stays alive 8s. |
 | `claude-deck revert` | Restore the original `Claude.app` from backup. |
 | `claude-deck status` | Show patch state, hashes, backup info, known profiles. |
 | `claude-deck open <name>` | Launch Claude with that profile, or focus its window if already running. |
@@ -58,6 +59,7 @@ Open `http://localhost:8965` to see the dashboard.
 - **Asar extract, inject, repack.** `/Applications/Claude.app/Contents/Resources/app.asar` is unpacked with `@electron/asar`, a small `claude-deck.js` is written at the asar root and wired into the Electron main process, then the asar is repacked.
 - **Info.plist hash fix.** Electron checks a SHA-256 of the asar (`ElectronAsarIntegrity` in `Info.plist`) before it will load it. The script recomputes that hash after repacking and writes it back with `PlistBuddy`.
 - **Ad-hoc re-sign, no `--deep`.** The outer app bundle is re-signed so macOS will still launch it. Adding `--deep` would re-sign every nested helper too, which breaks their keychain permissions and makes macOS ask for keychain access on every launch. This script never does that.
+- **Entitlements are stripped, not just preserved.** An ad-hoc signature can never carry Apple's restricted entitlements (app identifier, team identifier, keychain groups); macOS's stricter checks on Apple Silicon refuse to launch a binary that has them anyway. The script reads the app's own entitlements, drops those three keys, and adds one that lets the ad-hoc binary still load Electron's genuinely-signed nested framework. See "macOS signing" below.
 - **`--profile=NAME` launch flag.** Each profile gets its own Electron `userData` folder under `~/Library/Application Support/Claude Profiles/<name>`, which is what gives it a separate, simultaneous login.
 - **Session reporter.** The injected code reads each profile's session cookie and writes it to `~/.claude-deck/profiles/<name>.json`, which the dashboard reads to show usage.
 
@@ -75,6 +77,18 @@ sudo claude-deck watchdog on     # or: reapply automatically, forever
 ```
 
 The watchdog is a `launchd` job that watches `Info.plist` for changes. It skips while Claude is running, and it logs to `/var/log/claude-deck.log`.
+
+---
+
+## macOS 26 / Apple Silicon signing
+
+Patching re-signs `Claude.app` ad-hoc (no Apple certificate). An ad-hoc signature can never carry Apple's **restricted** entitlements: `com.apple.application-identifier`, `com.apple.developer.team-identifier`, `keychain-access-groups`. Modern macOS refuses to launch a binary at all if an ad-hoc signature has them.
+
+So the script strips those three and adds `com.apple.security.cs.disable-library-validation`, which lets the ad-hoc-signed app still load Electron's own framework (which stays genuinely Anthropic-signed inside the bundle).
+
+**What this costs you:** hardware-key and passkey login (WebAuthn) may not work in a patched app, because that relied on the keychain groups tied to Anthropic's certificate. **What still works:** password login, Google login, and any session you're already logged into.
+
+`claude-deck revert` restores Claude's original code, but it's still ad-hoc-signed (the same launch requirement applies). For a fully genuine, Anthropic-signed app again, reinstall Claude from anthropic.com.
 
 ---
 
@@ -97,11 +111,20 @@ The usage numbers come from the same endpoints `claude.ai`'s own web app uses. T
 **Claude keeps asking for keychain access after patching.**
 This means the patch was applied with `codesign --deep` at some point. Run `claude-deck revert` then `claude-deck patch` to get a clean ad-hoc signature on the outer bundle only.
 
+**Claude won't open at all after patching (macOS 26+, Apple Silicon).**
+This was a real bug: modern macOS refuses to launch an ad-hoc-signed app that still carries Apple's restricted entitlements. Update claude-deck (`git pull`) and re-run `claude-deck patch`: the current version strips those entitlements automatically. See "macOS 26 / Apple Silicon signing" above.
+
+**Hardware-key or passkey login doesn't work in a patched Claude.**
+Expected: see "macOS 26 / Apple Silicon signing" above. Use password or Google login instead, or an account you're already logged into.
+
 **Dashboard shows "session key expired."**
 Open that profile once with `claude-deck open <name>`. The key refreshes automatically the next time you're logged in.
 
 **Claude updated and my profiles are "gone" from the launcher.**
 Nothing was deleted. Run `claude-deck patch` again: the profile data is still on disk, the patch just needs reapplying.
+
+**Claude would not open at all after patching with an older claude-deck.**
+Reinstall Claude once (fresh copy from anthropic.com), update claude-deck (`git pull`), then re-run `claude-deck patch`. Older versions of this script didn't preserve `app.asar.unpacked` (the native modules Electron loads straight off disk), so repacking could silently break the app on newer Claude builds that ship those files. That's fixed now.
 
 ---
 

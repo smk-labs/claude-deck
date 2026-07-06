@@ -12,7 +12,7 @@
 # native tools (curl, tar, shasum, codesign, PlistBuddy, osascript).
 #
 # Usage:
-#   ./claude-deck.sh patch [--force]   # apply (idempotent)
+#   ./claude-deck.sh patch [--force] [--verify-launch]  # apply (idempotent)
 #   ./claude-deck.sh revert            # restore original Claude.app
 #   ./claude-deck.sh status            # show patch state, hashes, backup info
 #   ./claude-deck.sh open [name]       # launch/focus a profile (no name = default)
@@ -42,13 +42,65 @@ if [ "$(id -u)" = "0" ] && [ -n "$_TARGET_USER" ]; then
   fi
 fi
 
-APP="/Applications/Claude.app"
+# --app <path> (hidden option, also settable via CLAUDE_DECK_APP) redirects
+# every APP/RES/ASAR/PLIST path at an alternate .app bundle instead of the
+# real /Applications/Claude.app. This exists purely so the patch logic can be
+# smoke-tested against a scratch copy of the app without touching the real
+# one. It is scanned out of argv here, before dispatch, so every subcommand
+# sees the override transparently. When the target is user-writable we also
+# skip sudo entirely (see SUDO below) so a scratch copy never prompts.
+APP="${CLAUDE_DECK_APP:-/Applications/Claude.app}"
+_argv=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --app)
+      shift
+      [ $# -gt 0 ] || { printf "✗ --app requires a path argument\n" >&2; exit 1; }
+      APP="$1"
+      shift
+      ;;
+    --app=*)
+      APP="${1#--app=}"
+      shift
+      ;;
+    *)
+      _argv+=("$1")
+      shift
+      ;;
+  esac
+done
+if [ ${#_argv[@]} -gt 0 ]; then
+  set -- "${_argv[@]}"
+else
+  set --
+fi
+
 RES="$APP/Contents/Resources"
 ASAR="$RES/app.asar"
 PLIST="$APP/Contents/Info.plist"
+
+# Use plain (non-sudo) file operations when the target bundle is user-writable
+# (i.e. a scratch/test copy, never the real /Applications install which is
+# root:admin). This lets --app point at a throwaway copy without any sudo
+# prompts. SUDO is always assigned exactly one of two literal strings, never
+# unset, so `$SUDO cmd` below is safe under `set -u`.
+if [ -w "$APP" ] 2>/dev/null; then
+  SUDO=""
+else
+  SUDO="sudo"
+fi
+
 STATE_DIR="$HOME/.claude-deck"
+# Backups for an alternate --app target live in their own tree so a smoke
+# test against a scratch copy can never read from or clobber the real
+# Claude.app backup. Everything else (bootstrapped Node, the asar tool,
+# captured profile session keys) is shared: those aren't app-bundle state.
 BACKUP_DIR="$STATE_DIR/backup"
+if [ "$APP" != "/Applications/Claude.app" ]; then
+  BACKUP_DIR="$STATE_DIR/backup-alt"
+fi
 BACKUP_ASAR="$BACKUP_DIR/app.asar.orig"
+BACKUP_UNPACKED="$BACKUP_DIR/app.asar.unpacked.orig"
 BACKUP_HASH="$BACKUP_DIR/original-hash.txt"
 BACKUP_VERSION="$BACKUP_DIR/claude-version.txt"
 PROFILES_DIR="$STATE_DIR/profiles"
@@ -171,6 +223,15 @@ asar_run() {
 }
 
 quit_claude() {
+  # Never quit/kill the real, running Claude Desktop app as a side effect of
+  # patching a --app scratch target: osascript/pkill here are name-based
+  # ("Claude"), not path-based, so they'd hit the real app regardless of
+  # which bundle we're actually patching. Only act when the target IS the
+  # real install.
+  if [ "$APP" != "/Applications/Claude.app" ]; then
+    c_dim "Skipping quit_claude: target is $APP, not the real Claude.app."
+    return 0
+  fi
   # Don't issue `tell app to quit` if Claude isn't running: AppleScript
   # would launch it just to quit it (matters during watchdog runs).
   if ! pgrep -x "Claude" >/dev/null 2>&1; then
@@ -202,6 +263,95 @@ plist_hash() {
   /usr/libexec/PlistBuddy -c "Print :ElectronAsarIntegrity:Resources/app.asar:hash" "$PLIST" 2>/dev/null || echo ""
 }
 
+# Prints every path in an asar's header marked unpacked:true, one per line,
+# sorted. Native modules (*.node), dylibs, and node-pty's spawn-helper are
+# stored this way so Electron can dlopen/exec them straight off disk instead
+# of from inside the asar archive (which it cannot do). Losing this set on
+# repack is exactly what bricks the app: see asar_pack_preserving_unpacked.
+asar_unpacked_list() {
+  local target="$1"
+  ( cd "$TOOL_DIR" && "$NODE_BIN" -e "
+    const asar = require('@electron/asar');
+    const { header } = asar.getRawHeader(process.argv[1]);
+    function walk(node, prefix, out) {
+      if (!node.files) return;
+      for (const name of Object.keys(node.files)) {
+        const entry = node.files[name];
+        const p = prefix ? prefix + '/' + name : name;
+        if (entry.files) walk(entry, p, out);
+        else if (entry.unpacked) out.push(p);
+      }
+    }
+    const out = [];
+    walk(header, '', out);
+    out.sort();
+    process.stdout.write(out.join('\n'));
+    if (out.length) process.stdout.write('\n');
+  " "$target" )
+}
+
+# Repacks $1 (extracted asar tree) into $2 (new asar path), preserving
+# whichever files were unpacked:true in the ORIGINAL asar ($3, one path per
+# line, sorted). Native modules cannot be dlopen'd from inside an asar, so
+# if this set is lost on repack Electron's main process crashes before any
+# window opens: this is the exact bug that bricked the app on modern Claude
+# Desktop (1.17377.2), which ships 9 unpacked files where the
+# previously-tested 1.8555.2 shipped none.
+#
+# Primary strategy: an exact brace-glob of the original files' BASENAMES,
+# e.g. "{foo.node,spawn-helper}". @electron/asar's unpack matcher
+# (lib/asar.js, shouldUnpackPath) runs minimatch with {matchBase: true}
+# against each file's basename, not its full relative path — a brace-glob
+# of full paths silently matches nothing (verified empirically: 0/9 files
+# reproduced). Basenames are therefore the correct "exact" primary, and in
+# practice unpacked native files have distinctive basenames so this is not
+# a meaningfully weaker match than full paths would be.
+#
+# Fallback: a generic pattern covering every unpacked file *type* we've
+# observed in this app (native modules, dylibs, node-pty's extensionless
+# spawn-helper). Used only if the exact-basename pack doesn't reproduce the
+# original set. Either way, the caller still runs its own post-pack
+# equality check: this function's belief that it succeeded is not the gate.
+asar_pack_preserving_unpacked() {
+  local extract_dir="$1" out_asar="$2" orig_list_file="$3"
+  local basenames_file pattern try_list_file
+
+  if [ -s "$orig_list_file" ]; then
+    basenames_file="$(mktemp)"
+    while IFS= read -r _p; do
+      [ -n "$_p" ] || continue
+      basename "$_p"
+    done < "$orig_list_file" | sort -u > "$basenames_file"
+
+    step "Repacking with exact unpacked-basename list ($(wc -l < "$basenames_file" | tr -d ' ') names)..."
+    pattern="{$(paste -s -d, "$basenames_file")}"
+    rm -f "$basenames_file"
+    ( cd "$TOOL_DIR" && "$NODE_BIN" -e "
+      const asar = require('@electron/asar');
+      asar.createPackageWithOptions(process.argv[1], process.argv[2], { unpack: process.argv[3] })
+        .then(() => process.exit(0))
+        .catch((e) => { console.error(String(e && e.stack || e)); process.exit(1); });
+    " "$extract_dir" "$out_asar" "$pattern" ) || die "asar pack (exact-basename unpack) failed."
+
+    try_list_file="$(mktemp)"
+    asar_unpacked_list "$out_asar" > "$try_list_file"
+    if diff -q "$orig_list_file" "$try_list_file" >/dev/null 2>&1; then
+      rm -f "$try_list_file"
+      return 0
+    fi
+    rm -f "$try_list_file"
+    c_yellow "Exact unpacked-basename match failed to reproduce the original set; falling back to pattern match."
+  fi
+
+  step "Repacking with generic unpacked pattern (**/*.node, **/*.dylib, **/spawn-helper)..."
+  ( cd "$TOOL_DIR" && "$NODE_BIN" -e "
+    const asar = require('@electron/asar');
+    asar.createPackageWithOptions(process.argv[1], process.argv[2], { unpack: '{**/*.node,**/*.dylib,**/spawn-helper}' })
+      .then(() => process.exit(0))
+      .catch((e) => { console.error(String(e && e.stack || e)); process.exit(1); });
+  " "$extract_dir" "$out_asar" ) || die "asar pack (fallback pattern unpack) failed."
+}
+
 is_patched() {
   # "patched" = our marker file present inside the asar
   asar_run list "$ASAR" 2>/dev/null | grep -q "/$MARKER$"
@@ -214,6 +364,131 @@ has_other_patch() {
 
 claude_version() {
   /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST" 2>/dev/null || echo "?"
+}
+
+# Restricted entitlement keys that AMFI only allows under a genuine Apple
+# team signature. An ad-hoc signature (sign identity "-") can never carry
+# these: if they're present, macOS 26's stricter AMFI refuses to launch the
+# binary at all ("adhoc signed but contains restricted entitlements"), even
+# though `codesign --verify` reports the signature itself as structurally
+# valid. They must be stripped before any ad-hoc re-sign.
+RESTRICTED_ENTITLEMENT_KEYS="com.apple.application-identifier com.apple.developer.team-identifier keychain-access-groups"
+
+# Dropping the restricted keys above means the ad-hoc-signed outer executable
+# can no longer satisfy Library Validation when it loads the still
+# genuinely-signed nested Electron Framework (different/no team ID). Adding
+# this key (instead of `--deep` ad-hoc-signing every nested helper, which
+# reintroduces the keychain-prompt regression) tells the kernel to skip that
+# check for this process, so the outer binary can still load Electron's
+# nested, genuinely-signed frameworks.
+DISABLE_LIB_VALIDATION_KEY="com.apple.security.cs.disable-library-validation"
+
+# Builds an entitlements plist suitable for our ad-hoc re-sign, at $1
+# (destination path). Derives it from the TARGET app's own current
+# entitlements so it self-adapts if Anthropic adds/removes entitlements in a
+# future release, rather than a hardcoded snapshot going stale.
+#
+# Strategy: dump $APP's live entitlements, delete the restricted keys, add
+# disable-library-validation. If the dump is empty (unsigned app, or a
+# scratch target with no signature at all), fall back to a minimal hardcoded
+# plist with exactly the non-restricted keys this app is known to ship
+# (com.apple.security.cs.allow-jit plus the device/personal-information/
+# virtualization entitlements) so hardware access (mic, camera, etc.) still
+# works after patching.
+build_adhoc_entitlements() {
+  local out="$1"
+  local dump
+  dump="$(mktemp)"
+
+  # codesign's `--entitlements <path>` form writes a real plist file
+  # directly; older/other codesign builds only support `--entitlements :-`
+  # (dash form) which streams to stdout. Try the direct-file form first,
+  # fall back to the stdout form if it produced nothing.
+  codesign -d --entitlements "$dump" --xml "$APP" >/dev/null 2>&1 || true
+  if [ ! -s "$dump" ]; then
+    codesign -d --entitlements :- --xml "$APP" > "$dump" 2>/dev/null || true
+  fi
+
+  if [ -s "$dump" ]; then
+    cp "$dump" "$out"
+    local key
+    for key in $RESTRICTED_ENTITLEMENT_KEYS; do
+      /usr/libexec/PlistBuddy -c "Delete :$key" "$out" >/dev/null 2>&1 || true
+    done
+    if ! /usr/libexec/PlistBuddy -c "Print :$DISABLE_LIB_VALIDATION_KEY" "$out" >/dev/null 2>&1; then
+      /usr/libexec/PlistBuddy -c "Add :$DISABLE_LIB_VALIDATION_KEY bool true" "$out" >/dev/null 2>&1
+    else
+      /usr/libexec/PlistBuddy -c "Set :$DISABLE_LIB_VALIDATION_KEY true" "$out" >/dev/null 2>&1
+    fi
+  else
+    c_yellow "Could not read existing entitlements from $APP (unsigned target?); using minimal fallback set."
+    cat > "$out" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<key>com.apple.security.device.bluetooth</key>
+	<true/>
+	<key>com.apple.security.device.camera</key>
+	<true/>
+	<key>com.apple.security.device.print</key>
+	<true/>
+	<key>com.apple.security.device.usb</key>
+	<true/>
+	<key>com.apple.security.personal-information.location</key>
+	<true/>
+	<key>com.apple.security.personal-information.photos-library</key>
+	<true/>
+	<key>com.apple.security.virtualization</key>
+	<true/>
+	<key>$DISABLE_LIB_VALIDATION_KEY</key>
+	<true/>
+</dict>
+</plist>
+PLIST
+  fi
+  rm -f "$dump"
+}
+
+# Asserts that a just-signed $APP's entitlements are launch-safe: none of the
+# restricted keys survived (AMFI would reject them on an ad-hoc signature),
+# and disable-library-validation is present and true (needed so the ad-hoc
+# outer executable can still load Electron's genuinely-signed nested
+# framework). This is a static proxy for "will AMFI actually let this
+# launch": codesign --verify alone does not catch a restricted-entitlement
+# rejection, since the signature itself is structurally valid, it's AMFI's
+# separate policy check that refuses it at launch.
+assert_launch_safe_entitlements() {
+  local dump
+  dump="$(mktemp)"
+  codesign -d --entitlements "$dump" --xml "$APP" >/dev/null 2>&1 || true
+  if [ ! -s "$dump" ]; then
+    codesign -d --entitlements :- --xml "$APP" > "$dump" 2>/dev/null || true
+  fi
+
+  if [ ! -s "$dump" ]; then
+    rm -f "$dump"
+    die "Post-validation failed: could not read back signed entitlements from $APP."
+  fi
+
+  local key
+  for key in $RESTRICTED_ENTITLEMENT_KEYS; do
+    if /usr/libexec/PlistBuddy -c "Print :$key" "$dump" >/dev/null 2>&1; then
+      rm -f "$dump"
+      die "Post-validation failed: restricted entitlement '$key' is still present on the ad-hoc-signed bundle. AMFI will refuse to launch it. Rolling back."
+    fi
+  done
+
+  local dlv_value
+  dlv_value="$(/usr/libexec/PlistBuddy -c "Print :$DISABLE_LIB_VALIDATION_KEY" "$dump" 2>/dev/null || echo "")"
+  rm -f "$dump"
+  if [ "$dlv_value" != "true" ]; then
+    die "Post-validation failed: $DISABLE_LIB_VALIDATION_KEY is not set to true on the signed bundle. The ad-hoc binary would fail Library Validation when loading Electron's nested framework. Rolling back."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -260,12 +535,22 @@ cmd_status() {
 
 cmd_patch() {
   local force="no"
+  local verify_launch="no"
   local arg
   for arg in "$@"; do
     case "$arg" in
       --force) force="yes" ;;
+      --verify-launch) verify_launch="yes" ;;
     esac
   done
+
+  # --verify-launch spawns the freshly-patched app to confirm it actually
+  # stays alive. This is only safe against a throwaway --app target: it must
+  # never auto-run (or be allowed to run) against the real, already-running
+  # Claude Desktop install.
+  if [ "$verify_launch" = "yes" ] && [ "$APP" = "/Applications/Claude.app" ]; then
+    die "--verify-launch refuses to run against the real /Applications/Claude.app. Use --app <scratch-copy> to smoke-test a launch."
+  fi
 
   ensure_prereqs
 
@@ -294,8 +579,23 @@ cmd_patch() {
     fi
   fi
 
+  # Preflight gate, before touching anything. If Claude's internal layout no
+  # longer has the entry point we inject into, we must find out now: not
+  # after the original asar has already been overwritten.
+  step "Preflight: checking asar layout..."
+  if ! asar_run list "$ASAR" 2>/dev/null | grep -q '/\.vite/build/index\.pre\.js$'; then
+    die "Entry point .vite/build/index.pre.js not found in $ASAR. Claude's internal app layout has changed; nothing was modified. Please check for a claude-deck update."
+  fi
+
   quit_claude
   _snapshot_backup_if_needed
+
+  # From here on, any failure must leave the installed app exactly as it was
+  # (or better: reverted to the known-good backup), never half-patched.
+  # ROLLBACK_ARMED is checked by _patch_rollback so a trap firing before the
+  # backup exists (or after we've already succeeded) is a no-op.
+  ROLLBACK_ARMED="yes"
+  trap _patch_rollback EXIT INT TERM
 
   WORK="$(mktemp -d)/claude-deck-asar"
   step "Extracting asar → $WORK"
@@ -314,37 +614,221 @@ cmd_patch() {
     } > "$ENTRY.tmp" && mv "$ENTRY.tmp" "$ENTRY"
   fi
 
-  step "Repacking asar..."
+  step "Recording which files are unpacked in the ORIGINAL asar..."
+  ORIG_UNPACKED_LIST="$(mktemp)"
+  asar_unpacked_list "$ASAR" > "$ORIG_UNPACKED_LIST"
+  c_dim "  $(wc -l < "$ORIG_UNPACKED_LIST" | tr -d ' ') unpacked file(s) in the original asar."
+
+  # asar.extractAll pulls unpacked files' CONTENT from the sibling
+  # Resources/app.asar.unpacked dir (verified: byte-for-byte correct), but it
+  # does NOT carry over their executable bit: every extracted file lands as
+  # plain 644. node-pty's spawn-helper and the @ant native .node binaries are
+  # execve'd/dlopen'd as Mach-O executables (mode 755 in the live install);
+  # losing +x here would silently break the pty/native bridge even though
+  # the app would still launch. Copy each unpacked file's real mode from the
+  # currently-installed app.asar.unpacked onto its extracted counterpart
+  # before we repack.
+  step "Restoring executable bits on unpacked files..."
+  if [ -d "$RES/app.asar.unpacked" ] && [ -s "$ORIG_UNPACKED_LIST" ]; then
+    while IFS= read -r _rel; do
+      [ -n "$_rel" ] || continue
+      _src="$RES/app.asar.unpacked/$_rel"
+      _dst="$WORK/$_rel"
+      if [ -f "$_src" ] && [ -f "$_dst" ]; then
+        _mode="$(stat -f "%Lp" "$_src" 2>/dev/null || echo "")"
+        [ -n "$_mode" ] && chmod "$_mode" "$_dst" 2>/dev/null || true
+      fi
+    done < "$ORIG_UNPACKED_LIST"
+  fi
+
+  step "Repacking asar (preserving unpacked native modules)..."
+  # Native *.node modules, dylibs, and node-pty's spawn-helper cannot be
+  # dlopen'd/exec'd from inside an asar archive. A plain "asar pack" with no
+  # --unpack rule marks everything packed, so Electron's main process throws
+  # on launch and Claude never opens at all: this is the exact bug that
+  # bricked the app before this fix existed. See asar_pack_preserving_unpacked
+  # above for the primary (exact-basename) vs fallback (generic pattern)
+  # strategy.
   TMP_ASAR="$(mktemp -t claude-deck-asar-XXXXXX).asar"
-  # Preserve files Electron loads from disk (native *.node modules + node-pty's
-  # spawn-helper). Without --unpack they get packed INTO the asar, where Electron
-  # cannot dlopen them, so the main process throws on launch and Claude never opens.
-  asar_run pack "$WORK" "$TMP_ASAR" --unpack "{*.node,spawn-helper}"
-  sudo mv "$TMP_ASAR" "$ASAR"
+  asar_pack_preserving_unpacked "$WORK" "$TMP_ASAR" "$ORIG_UNPACKED_LIST"
+
+  step "Verifying the repacked asar's unpacked set matches the original..."
+  NEW_UNPACKED_LIST="$(mktemp)"
+  asar_unpacked_list "$TMP_ASAR" > "$NEW_UNPACKED_LIST"
+  if ! diff -q "$ORIG_UNPACKED_LIST" "$NEW_UNPACKED_LIST" >/dev/null 2>&1; then
+    c_red "Original unpacked set:"
+    cat "$ORIG_UNPACKED_LIST" >&2
+    c_red "New unpacked set:"
+    cat "$NEW_UNPACKED_LIST" >&2
+    die "Repacked asar's unpacked file set does not match the original. Refusing to install (rollback will restore the app)."
+  fi
+  rm -f "$NEW_UNPACKED_LIST"
+
+  step "Installing new asar + app.asar.unpacked..."
+  $SUDO mv "$TMP_ASAR" "$ASAR"
+  # createPackageWithOptions writes its own sibling .unpacked dir next to the
+  # asar it just produced (same convention Electron itself uses). Install it
+  # wholesale so the native files it contains are the ones actually alongside
+  # the new asar. If there were no unpacked entries at all, nothing was
+  # generated: leave whatever was already in Resources alone.
+  if [ -d "$TMP_ASAR.unpacked" ]; then
+    if [ -d "$RES/app.asar.unpacked" ]; then
+      $SUDO rm -rf "$RES/app.asar.unpacked"
+    fi
+    $SUDO mv "$TMP_ASAR.unpacked" "$RES/app.asar.unpacked"
+  fi
 
   step "Updating ElectronAsarIntegrity hash in Info.plist..."
   NEWHASH=$(asar_header_hash)
-  sudo /usr/libexec/PlistBuddy -c "Set :ElectronAsarIntegrity:Resources/app.asar:hash $NEWHASH" "$PLIST"
+  $SUDO /usr/libexec/PlistBuddy -c "Set :ElectronAsarIntegrity:Resources/app.asar:hash $NEWHASH" "$PLIST"
   c_dim "  new header hash: $NEWHASH"
 
   step "Ad-hoc re-signing the bundle..."
   # Do NOT add --deep. --deep re-signs nested helpers (renderer/GPU helpers)
   # ad-hoc too, which invalidates their keychain ACLs and causes a keychain
-  # prompt on every single Claude launch afterward. Sign the outer bundle only,
-  # preserving identifier/entitlements/flags/runtime so Gatekeeper stays calm.
-  sudo codesign --force --sign - --preserve-metadata=identifier,entitlements,flags,runtime "$APP"
-  sudo xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+  # prompt on every single Claude launch afterward. Sign the outer bundle
+  # only, preserving identifier/flags/runtime (hardened runtime stays on) but
+  # NOT entitlements: an ad-hoc signature can never carry Apple's restricted
+  # entitlements (application-identifier, team-identifier,
+  # keychain-access-groups), and macOS 26's stricter AMFI refuses to launch a
+  # binary that has them anyway ("adhoc signed but contains restricted
+  # entitlements"). build_adhoc_entitlements derives a safe replacement set
+  # from the app's own current entitlements: see its comment for details.
+  ENT_PLIST="$(mktemp)"
+  build_adhoc_entitlements "$ENT_PLIST"
+  $SUDO codesign --force --sign - --preserve-metadata=identifier,flags,runtime --entitlements "$ENT_PLIST" "$APP"
+  $SUDO xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
 
   rm -rf "$(dirname "$WORK")"
+
+  step "Post-validation..."
+  local installed_hash plist_recorded_hash
+  installed_hash="$(asar_header_hash)"
+  plist_recorded_hash="$(plist_hash)"
+  [ "$installed_hash" = "$plist_recorded_hash" ] \
+    || die "Post-validation failed: installed asar header hash ($installed_hash) does not match Info.plist ($plist_recorded_hash)."
+  is_patched \
+    || die "Post-validation failed: marker $MARKER not found in installed asar."
+  FINAL_UNPACKED_LIST="$(mktemp)"
+  asar_unpacked_list "$ASAR" > "$FINAL_UNPACKED_LIST"
+  diff -q "$ORIG_UNPACKED_LIST" "$FINAL_UNPACKED_LIST" >/dev/null 2>&1 \
+    || die "Post-validation failed: installed asar's unpacked set no longer matches the original."
+  rm -f "$FINAL_UNPACKED_LIST" "$ORIG_UNPACKED_LIST" "$ENT_PLIST"
+  codesign --verify "$APP" >/dev/null 2>&1 \
+    || die "Post-validation failed: codesign --verify rejected the re-signed bundle."
+  # codesign --verify only checks signature structure; it does NOT catch a
+  # restricted-entitlement rejection (AMFI's separate, stricter policy check
+  # applies only at actual launch). Assert the signed entitlements are
+  # launch-safe so this gate would have caught the exact failure mode that
+  # slipped past --verify before.
+  assert_launch_safe_entitlements
+
+  if [ "$verify_launch" = "yes" ]; then
+    _verify_launch_stays_alive
+  fi
+
+  # Everything checked out: disarm the rollback trap before printing success.
+  # Restore the top-level chown-state-dir-back-to-owner trap rather than
+  # clearing traps outright, so a sudo/root invocation still hands
+  # $STATE_DIR back to the real user on exit.
+  ROLLBACK_ARMED="no"
+  trap _chown_state_on_exit EXIT
+  trap - INT TERM
 
   c_green "✓ Patched. Claude now understands --profile=NAME."
   c_dim   "Try: $0 open work   (launches a second, independent instance)"
   c_dim   "Revert anytime with: $0 revert"
 }
 
+# Spawns the just-patched $APP with a throwaway, isolated userData profile
+# and confirms the process is still alive 8 seconds later. This is the one
+# check that would have caught the actual AMFI-rejection failure mode
+# end-to-end (static entitlement assertions are a proxy; this is the real
+# thing). Guarded by the caller to only ever run for a non-real --app target.
+_verify_launch_stays_alive() {
+  local bin scratch_profile pid
+  bin="$APP/Contents/MacOS/Claude"
+  [ -x "$bin" ] || die "--verify-launch: executable not found at $bin"
+
+  scratch_profile="$(mktemp -d)/claude-deck-verify-launch"
+  step "Launching $bin --profile=verifylaunch for an 8s liveness check..."
+  ( "$bin" --profile=verifylaunch --user-data-dir="$scratch_profile" >/dev/null 2>&1 & echo $! > "$scratch_profile.pid" ) &
+  wait
+  pid="$(cat "$scratch_profile.pid" 2>/dev/null || echo "")"
+  rm -f "$scratch_profile.pid"
+
+  sleep 8
+
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    c_green "  Process $pid is still alive after 8s: launch verified."
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    kill -9 "$pid" 2>/dev/null || true
+  else
+    die "--verify-launch failed: the patched app did not stay running for 8s (likely rejected at launch, e.g. by AMFI). Rolling back."
+  fi
+  rm -rf "$scratch_profile" 2>/dev/null || true
+}
+
+# Runs on EXIT/INT/TERM for the whole duration cmd_patch is mutating the
+# installed app. If we get here with ROLLBACK_ARMED=yes, something failed
+# (die() calls exit 1, an unhandled command error trips `set -e`, or the user
+# hit Ctrl-C) partway through, so we restore the app to the pristine backup
+# rather than leave it in a half-patched, possibly-unlaunchable state.
+_patch_rollback() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if [ "${ROLLBACK_ARMED:-no}" != "yes" ]; then
+    _chown_state_on_exit
+    exit "$rc"
+  fi
+  c_yellow "Patch failed partway through: restoring the app from backup..."
+  if [ -f "$BACKUP_ASAR" ]; then
+    $SUDO cp "$BACKUP_ASAR" "$ASAR" 2>/dev/null || true
+  fi
+  if [ -d "$BACKUP_UNPACKED" ]; then
+    if [ -d "$RES/app.asar.unpacked" ]; then
+      $SUDO rm -rf "$RES/app.asar.unpacked" 2>/dev/null || true
+    fi
+    $SUDO cp -R "$BACKUP_UNPACKED" "$RES/app.asar.unpacked" 2>/dev/null || true
+  elif [ -d "$RES/app.asar.unpacked" ]; then
+    $SUDO rm -rf "$RES/app.asar.unpacked" 2>/dev/null || true
+  fi
+  local restored_hash=""
+  if [ -f "$BACKUP_HASH" ] && [ -s "$BACKUP_HASH" ]; then
+    restored_hash="$(cat "$BACKUP_HASH")"
+    $SUDO /usr/libexec/PlistBuddy -c "Set :ElectronAsarIntegrity:Resources/app.asar:hash $restored_hash" "$PLIST" 2>/dev/null || true
+  fi
+  ROLLBACK_ENT_PLIST="$(mktemp)"
+  build_adhoc_entitlements "$ROLLBACK_ENT_PLIST" 2>/dev/null || true
+  $SUDO codesign --force --sign - --preserve-metadata=identifier,flags,runtime --entitlements "$ROLLBACK_ENT_PLIST" "$APP" 2>/dev/null || true
+  rm -f "$ROLLBACK_ENT_PLIST"
+  $SUDO xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+
+  # PlistBuddy can exit 0 while silently failing to write (e.g. a read-only
+  # Info.plist), which is exactly the kind of failure this trap exists to
+  # catch. Verify the restore actually took before declaring victory; if it
+  # didn't, say so honestly instead of printing a false all-clear.
+  local now_hash
+  now_hash="$(plist_hash 2>/dev/null || echo "")"
+  if [ -n "$restored_hash" ] && [ "$now_hash" != "$restored_hash" ]; then
+    c_red "Rollback could not restore Info.plist's ElectronAsarIntegrity hash"
+    c_red "(wanted $restored_hash, found $now_hash). The asar file itself was"
+    c_red "restored, but the plist may still be wrong: check file permissions"
+    c_red "on $PLIST and re-run '$0 revert' by hand."
+  else
+    c_yellow "App restored to its pre-patch state (untouched-equivalent). Nothing is broken."
+  fi
+  _chown_state_on_exit
+  exit "$rc"
+}
+
 # Snapshot originals into $BACKUP_DIR (only if we don't have a clean backup
 # yet, or the installed Claude version has moved on since the last backup,
-# in which case the old backup is stale and we refresh it).
+# in which case the old backup is stale and we refresh it). Also backs up
+# app.asar.unpacked when present, so a later revert can restore the exact
+# native-module files that shipped with that pristine asar, not whatever
+# claude-deck most recently wrote there.
 _snapshot_backup_if_needed() {
   mkdir -p "$BACKUP_DIR"
   if [ -f "$BACKUP_ASAR" ] && [ -f "$BACKUP_VERSION" ]; then
@@ -356,7 +840,8 @@ _snapshot_backup_if_needed() {
       c_yellow "Refreshing backup (the currently installed asar is assumed pristine right now,"
       c_yellow "i.e. this is a fresh, unpatched install after an app update)."
       step "Refreshing pristine backup → $BACKUP_ASAR"
-      sudo cp "$ASAR" "$BACKUP_ASAR"
+      $SUDO cp "$ASAR" "$BACKUP_ASAR"
+      _backup_unpacked_dir
       plist_hash > "$BACKUP_HASH"
       claude_version > "$BACKUP_VERSION"
     else
@@ -365,9 +850,26 @@ _snapshot_backup_if_needed() {
     return
   fi
   step "Saving pristine backup → $BACKUP_ASAR"
-  sudo cp "$ASAR" "$BACKUP_ASAR"
+  $SUDO cp "$ASAR" "$BACKUP_ASAR"
+  _backup_unpacked_dir
   plist_hash > "$BACKUP_HASH"
   claude_version > "$BACKUP_VERSION"
+}
+
+# Copies the currently-installed Resources/app.asar.unpacked (if any) into
+# the backup dir, and removes any stale backup copy if the current install
+# has none (e.g. a hypothetical future Claude build ships no native modules).
+_backup_unpacked_dir() {
+  if [ -d "$RES/app.asar.unpacked" ]; then
+    if [ -d "$BACKUP_UNPACKED" ]; then
+      $SUDO rm -rf "$BACKUP_UNPACKED"
+    fi
+    $SUDO cp -R "$RES/app.asar.unpacked" "$BACKUP_UNPACKED"
+  else
+    if [ -d "$BACKUP_UNPACKED" ]; then
+      $SUDO rm -rf "$BACKUP_UNPACKED"
+    fi
+  fi
 }
 
 # Writes the injected main-process module. Kept in its own function (instead
@@ -517,25 +1019,52 @@ cmd_revert() {
   quit_claude
 
   step "Restoring original app.asar from $BACKUP_ASAR..."
-  sudo cp "$BACKUP_ASAR" "$ASAR"
+  $SUDO cp "$BACKUP_ASAR" "$ASAR"
+
+  step "Restoring original app.asar.unpacked..."
+  if [ -d "$BACKUP_UNPACKED" ]; then
+    if [ -d "$RES/app.asar.unpacked" ]; then
+      $SUDO rm -rf "$RES/app.asar.unpacked"
+    fi
+    $SUDO cp -R "$BACKUP_UNPACKED" "$RES/app.asar.unpacked"
+  elif [ -d "$RES/app.asar.unpacked" ]; then
+    # The pristine backup had no unpacked dir (nothing was unpacked in that
+    # build), but the patched install has one: remove it so revert is exact.
+    $SUDO rm -rf "$RES/app.asar.unpacked"
+  fi
 
   if [ -f "$BACKUP_HASH" ] && [ -s "$BACKUP_HASH" ]; then
     OLDHASH=$(cat "$BACKUP_HASH")
     step "Restoring ElectronAsarIntegrity hash → $OLDHASH"
-    sudo /usr/libexec/PlistBuddy -c "Set :ElectronAsarIntegrity:Resources/app.asar:hash $OLDHASH" "$PLIST"
+    $SUDO /usr/libexec/PlistBuddy -c "Set :ElectronAsarIntegrity:Resources/app.asar:hash $OLDHASH" "$PLIST"
   else
     c_yellow "No saved Info.plist hash; recomputing from restored asar..."
     OLDHASH=$(asar_header_hash)
-    sudo /usr/libexec/PlistBuddy -c "Set :ElectronAsarIntegrity:Resources/app.asar:hash $OLDHASH" "$PLIST"
+    $SUDO /usr/libexec/PlistBuddy -c "Set :ElectronAsarIntegrity:Resources/app.asar:hash $OLDHASH" "$PLIST"
   fi
 
   step "Ad-hoc re-signing to keep Gatekeeper happy..."
-  # Same --deep caveat as cmd_patch: never add it here either.
-  sudo codesign --force --sign - --preserve-metadata=identifier,entitlements,flags,runtime "$APP"
-  sudo xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+  # Same --deep caveat as cmd_patch: never add it here either. The restored
+  # asar's ORIGINAL signature was Anthropic-genuine, but we can only ever
+  # produce an ad-hoc one, so the same entitlement-stripping applies here:
+  # restricted keys dropped, disable-library-validation added. This means
+  # revert makes the app content-pristine but still ad-hoc-signed, not a
+  # true return to Anthropic's genuine signature (see README).
+  REVERT_ENT_PLIST="$(mktemp)"
+  build_adhoc_entitlements "$REVERT_ENT_PLIST"
+  $SUDO codesign --force --sign - --preserve-metadata=identifier,flags,runtime --entitlements "$REVERT_ENT_PLIST" "$APP"
+  rm -f "$REVERT_ENT_PLIST"
+  $SUDO xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
 
-  c_green "✓ Reverted. Claude is back to its original state."
+  step "Verifying signature is launch-safe..."
+  codesign --verify "$APP" >/dev/null 2>&1 \
+    || die "Post-revert validation failed: codesign --verify rejected the re-signed bundle."
+  assert_launch_safe_entitlements
+
+  c_green "✓ Reverted. Claude is back to its original content, ad-hoc signed."
   c_dim   "Backup retained at $BACKUP_ASAR. Delete $STATE_DIR if you don't need it."
+  c_dim   "Note: this is content-pristine but not Anthropic-signed. For a fully"
+  c_dim   "genuine signature (e.g. hardware-key/passkey login), reinstall Claude."
 }
 
 # ---------------------------------------------------------------------------
@@ -871,7 +1400,10 @@ Teaches Claude.app a --profile=NAME argument (separate Electron userData per
 profile = separate simultaneous logins), plus a local usage dashboard.
 
 Usage:
-  $0 patch [--force]     apply the patch (idempotent; safe to re-run)
+  $0 patch [--force] [--verify-launch]
+                         apply the patch (idempotent; safe to re-run)
+                         --verify-launch: smoke-test the launch (only allowed
+                         with --app <scratch-copy>, never the real install)
   $0 revert              restore the original Claude.app
   $0 status              show patch state, hashes, backup info, profiles
   $0 open [name]         launch/focus a profile (no name = default profile)
@@ -885,7 +1417,10 @@ Usage:
 Notes:
   - patch/revert require sudo (writes into /Applications/Claude.app).
   - Backup of the original app.asar is saved in: $BACKUP_DIR
-  - Re-signs the bundle ad-hoc (Apple notarization is lost, locally-only fine).
+  - Re-signs the bundle ad-hoc (Apple notarization is lost, locally-only
+    fine). This strips Apple's restricted entitlements and adds
+    disable-library-validation; see README for what that means for
+    hardware-key/passkey login.
   - Profile session keys are cached in: $PROFILES_DIR (mode 600)
 EOF
 }
