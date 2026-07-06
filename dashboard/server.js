@@ -105,6 +105,34 @@ function validName(name) {
   return typeof name === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(name);
 }
 
+// Locates claude-deck.sh so handleOpen can shell out to `open <name>` and
+// pick up its self-healing session-index link (ensure_profile_index_link)
+// instead of only ever calling macOS `open` directly. Checked in priority
+// order: the canonical installed copy first, then the repo copy that sits
+// next to this dashboard/ directory (covers running the dashboard straight
+// from a git checkout, without `claude-deck install`). Returns null if
+// neither exists, so the caller can fall back to the old direct-open path.
+let _cachedScriptPath;
+function findClaudeDeckScript() {
+  if (_cachedScriptPath !== undefined) return _cachedScriptPath;
+  const candidates = [
+    path.join(os.homedir(), '.claude-deck', 'bin', 'claude-deck.sh'),
+    path.join(__dirname, '..', 'claude-deck.sh'),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        _cachedScriptPath = candidate;
+        return candidate;
+      }
+    } catch (e) {
+      // keep checking remaining candidates
+    }
+  }
+  _cachedScriptPath = null;
+  return null;
+}
+
 function getRunningProfiles() {
   return new Promise((resolve) => {
     execFile('ps', ['ax', '-o', 'command'], { maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
@@ -528,6 +556,25 @@ function handleOpen(req, res) {
         sendJson(res, 200, { ok: true, activated: true });
       });
       return;
+    }
+
+    // Named profiles: prefer routing through claude-deck.sh's own `open`
+    // subcommand, so a dashboard-initiated launch self-heals the session-index
+    // symlink (ensure_profile_index_link) exactly like a CLI `claude-deck open`
+    // would, instead of depending solely on whatever's currently injected into
+    // the app bundle. Falls back to the direct `open` invocation (unchanged
+    // behavior) if no installed script can be found. The default profile
+    // never goes through the script: cmd_open's own default handling is just
+    // `open -a "Claude"`, identical to the fallback below, so there's nothing
+    // to gain and no reason to shell out for it.
+    if (name !== 'default') {
+      const script = findClaudeDeckScript();
+      if (script) {
+        return execFile('/bin/bash', [script, 'open', name], (err) => {
+          if (err) return sendJson(res, 500, { ok: false, error: 'failed to launch Claude' });
+          sendJson(res, 200, { ok: true });
+        });
+      }
     }
 
     const args =

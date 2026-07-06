@@ -45,7 +45,8 @@ Open `http://localhost:8965` to see the dashboard.
 | `claude-deck status` | Show patch state, hashes, backup info, known profiles. |
 | `claude-deck open <name>` | Launch Claude with that profile, or focus its window if already running. |
 | `claude-deck list` | List known profiles and their cached usage. |
-| `claude-deck dash [port]` | Start the local dashboard (default port 8965). |
+| `claude-deck dash [port]` | Start the local dashboard (default port 8965). Repairs all profile index links first. |
+| `claude-deck doctor` | Repair every profile's session-index link, check the installed patch is current, run claude-sync if Claude is closed. |
 | `claude-deck install` | Copy the script to `~/.claude-deck/` and add the `claude-deck` alias. |
 | `claude-deck uninstall` | Remove the alias only (does not revert the patch). |
 | `claude-deck watchdog on\|off` | Auto-reapply the patch whenever Claude updates (needs sudo). |
@@ -70,6 +71,8 @@ Open `http://localhost:8965` to see the dashboard.
 Profiles share one Claude Code session index (it's symlinked into the default app's own index folder), so every profile of the **same** account sees the same session list instantly. No extra step needed.
 
 To see Claude Code sessions **across different accounts**, use the companion tool [claude-sync](https://github.com/smk-labs/claude-sync): start one throwaway Claude Code session in the new account first, then run claude-sync (or its auto watcher).
+
+**Self-healing.** The index link no longer depends on the app patch being current: every `claude-deck open <name>` (and every open from the dashboard) repairs or creates the profile's session-index link before launching, and `claude-deck dash` repairs all profiles at startup. If something still looks off, run `claude-deck doctor`: it fixes every profile's link in one pass, tells you if the installed patch carries an outdated injection, and runs claude-sync for you when Claude is closed.
 
 > If you're updating claude-deck from an older version, run `claude-deck patch --force` once so this fix takes effect.
 

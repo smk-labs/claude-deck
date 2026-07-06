@@ -18,6 +18,7 @@
 #   ./claude-deck.sh open [name]       # launch/focus a profile (no name = default)
 #   ./claude-deck.sh list              # list known profiles
 #   ./claude-deck.sh dash [port]       # run the local usage dashboard
+#   ./claude-deck.sh doctor            # repair session-index links, check patch freshness
 #   ./claude-deck.sh install           # copy to ~/.claude-deck/bin + zsh alias
 #   ./claude-deck.sh uninstall         # remove the alias only
 #   ./claude-deck.sh watchdog on|off   # (sudo) auto re-patch after app updates
@@ -107,6 +108,7 @@ PROFILES_DIR="$STATE_DIR/profiles"
 MARKER="claude-deck.js"      # presence in asar means "patched"
 OTHER_MARKER="rtl-fix.js"    # marker used by the sibling claude-rtl patch
 PROFILES_USERDATA_ROOT="$HOME/Library/Application Support/Claude Profiles"
+SHARED_SESSIONS_DIR="$HOME/Library/Application Support/Claude/claude-code-sessions"
 
 # Watchdog (root-owned copy + LaunchDaemon).
 WD_LABEL="com.smklabs.claude-deck"
@@ -1180,6 +1182,72 @@ _profile_is_running() {
   fi
 }
 
+# Shell twin of the Claude Code session-index symlink that the injected
+# claude-deck.js sets up inside the app's main process (see step 4 in
+# CLAUDE.md). This exists so linking a profile's session index into the
+# shared dir no longer depends on the installed app actually carrying a
+# fresh copy of that injected code: a stale patch, a scoping bug in an old
+# injected version, or an un-repatched app after a Claude update all used to
+# mean "no Code sessions show up." Calling this from the shell, on every
+# open/dash, makes the fix self-healing regardless of what's inside the asar.
+#
+# Never destructive: a real directory found at the link path is migrated
+# (additively) and kept as a timestamped backup, never deleted. Every step is
+# tolerant of odd pre-existing state (missing dirs, a live profile, etc.)
+# rather than tripping `set -e`.
+ensure_profile_index_link() {
+  local name="$1"
+  local profile_dir link shared
+  profile_dir="$PROFILES_USERDATA_ROOT/$name"
+  link="$profile_dir/claude-code-sessions"
+  shared="$SHARED_SESSIONS_DIR"
+
+  mkdir -p "$shared" 2>/dev/null || true
+  mkdir -p "$profile_dir" 2>/dev/null || true
+
+  if [ -L "$link" ]; then
+    return 0
+  fi
+
+  if _profile_is_running "$name" 2>/dev/null; then
+    c_dim "Profile '$name' is running: leaving its session index alone for now."
+    return 1
+  fi
+
+  if [ -d "$link" ]; then
+    step "Migrating existing session index for '$name' into the shared index..."
+    local copied=0
+    local acct_dir org_dir dest_acct_dir dest_org_dir f base
+    for acct_dir in "$link"/*/; do
+      [ -d "$acct_dir" ] || continue
+      acct_dir="${acct_dir%/}"
+      for org_dir in "$acct_dir"/*/; do
+        [ -d "$org_dir" ] || continue
+        org_dir="${org_dir%/}"
+        dest_acct_dir="$shared/$(basename "$acct_dir")"
+        dest_org_dir="$dest_acct_dir/$(basename "$org_dir")"
+        mkdir -p "$dest_org_dir" 2>/dev/null || true
+        for f in "$org_dir"/local_*.json; do
+          [ -e "$f" ] || continue
+          base="$(basename "$f")"
+          if [ ! -e "$dest_org_dir/$base" ]; then
+            cp "$f" "$dest_org_dir/$base" 2>/dev/null && copied=$((copied + 1)) || true
+          fi
+        done
+      done
+    done
+    c_dim "  merged $copied session file(s) into $shared"
+    mv "$link" "$link.migrated-$(date +%s)" 2>/dev/null || true
+    ln -s "$shared" "$link" 2>/dev/null || true
+    return 0
+  fi
+
+  # Missing (or any other non-symlink, non-dir state): just point it at the
+  # shared dir.
+  ln -s "$shared" "$link" 2>/dev/null || true
+  return 0
+}
+
 cmd_open() {
   local name="${1:-}"
 
@@ -1193,6 +1261,7 @@ cmd_open() {
   fi
 
   _validate_profile_name "$name"
+  ensure_profile_index_link "$name" || true
 
   if _profile_is_running "$name"; then
     step "Profile '$name' already running: focusing its window..."
@@ -1249,6 +1318,61 @@ cmd_list() {
   rm -f "$seen_file"
 }
 
+# Prints every named profile dir under $PROFILES_USERDATA_ROOT, one per line.
+# The "default" (no --profile) instance is never included: it has no dir
+# under Claude Profiles/ at all, and index-linking never applies to it.
+_list_named_profiles() {
+  [ -d "$PROFILES_USERDATA_ROOT" ] || return 0
+  find "$PROFILES_USERDATA_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | while IFS= read -r d; do
+    basename "$d"
+  done
+}
+
+# Repairs the session-index link for every known named profile. When $1 is
+# "quiet", only migration output survives (used by cmd_dash, which shouldn't
+# spam routine "already-linked" lines on every launch); otherwise prints one
+# line per profile with its outcome (used by cmd_doctor).
+_repair_all_profiles() {
+  local verbosity="${1:-verbose}"
+  local names
+  names="$(_list_named_profiles)"
+  if [ -z "$names" ]; then
+    [ "$verbosity" = "quiet" ] || c_dim "No named profiles found under: $PROFILES_USERDATA_ROOT"
+    return 0
+  fi
+  printf '%s\n' "$names" | while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    local link="$PROFILES_USERDATA_ROOT/$name/claude-code-sessions"
+    local was_symlink="no"
+    [ -L "$link" ] && was_symlink="yes"
+    local was_dir="no"
+    [ -d "$link" ] && [ ! -L "$link" ] && was_dir="yes"
+
+    if [ "$was_symlink" = "yes" ]; then
+      [ "$verbosity" = "quiet" ] || printf "  %-20s already-linked\n" "$name"
+      continue
+    fi
+
+    if _profile_is_running "$name" 2>/dev/null; then
+      printf "  %-20s skipped-running\n" "$name"
+      continue
+    fi
+
+    if [ "$was_dir" = "yes" ]; then
+      local before_count after_count
+      before_count=$(find "$SHARED_SESSIONS_DIR" -name 'local_*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+      ensure_profile_index_link "$name" >/dev/null 2>&1 || true
+      after_count=$(find "$SHARED_SESSIONS_DIR" -name 'local_*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+      printf "  %-20s migrated-and-linked (files now in shared index: %s, +%s new)\n" \
+        "$name" "$after_count" "$((after_count - before_count))"
+      continue
+    fi
+
+    ensure_profile_index_link "$name" >/dev/null 2>&1 || true
+    [ "$verbosity" = "quiet" ] || printf "  %-20s linked\n" "$name"
+  done
+}
+
 # ---------------------------------------------------------------------------
 # dash
 # ---------------------------------------------------------------------------
@@ -1268,6 +1392,7 @@ _resolve_node_for_dash() {
 
 cmd_dash() {
   local port="${1:-8965}"
+  _repair_all_profiles quiet
   _resolve_node_for_dash
 
   local script_dir
@@ -1278,6 +1403,58 @@ cmd_dash() {
   step "Starting dashboard on http://127.0.0.1:$port ..."
   ( sleep 1; open "http://127.0.0.1:$port" >/dev/null 2>&1 || true ) &
   CLAUDE_DECK_PORT="$port" exec "$DASH_NODE" "$server_js"
+}
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+# Best-effort: extracts just claude-deck.js from the installed asar into a
+# temp file and checks whether it still contains the old buggy reference
+# (`join(base, 'claude-code-sessions')`, where `base` was out of scope: see
+# CLAUDE.md step 4's "real bug, caught in production" note). Silent no-op
+# (prints nothing, never fails doctor) if node/the asar tool aren't
+# available or the app/asar can't be read: this check is a bonus, not load
+# bearing, since ensure_profile_index_link no longer depends on it.
+_doctor_check_injection_freshness() {
+  [ -f "$ASAR" ] || return 0
+  ( ensure_node && ensure_asar_tool ) >/dev/null 2>&1 || return 0
+
+  local extract_dir
+  extract_dir="$(mktemp -d)" || return 0
+  # asar's `extract-file` writes to basename(filename) in the CURRENT working
+  # directory (not an arbitrary destination), so cd into our scratch dir
+  # first rather than relying on asar_run's own cd into $TOOL_DIR.
+  if ! ( cd "$extract_dir" && "$NODE_BIN" "$TOOL_DIR/node_modules/@electron/asar/bin/asar.js" extract-file "$ASAR" "$MARKER" ) >/dev/null 2>&1; then
+    rm -rf "$extract_dir"
+    return 0
+  fi
+
+  if [ -f "$extract_dir/$MARKER" ] && grep -q "join(base, 'claude-code-sessions')" "$extract_dir/$MARKER" 2>/dev/null; then
+    c_yellow "Warning: the installed app carries an old injection with a known scoping bug"
+    c_yellow "(session-index linking silently failed). Recommend: sudo ./claude-deck.sh patch --force"
+  fi
+  rm -rf "$extract_dir"
+}
+
+cmd_doctor() {
+  step "Repairing session-index links for every named profile..."
+  _repair_all_profiles verbose
+
+  step "Checking installed patch freshness..."
+  _doctor_check_injection_freshness
+
+  local sync_script="$HOME/.claude/scripts/claude-sync.sh"
+  if [ -f "$sync_script" ]; then
+    if pgrep -x "Claude" >/dev/null 2>&1; then
+      c_dim "Claude is running: cross-account sync will happen automatically on next app quit (claude-sync watcher)."
+    else
+      step "Running claude-sync..."
+      bash "$sync_script" || c_yellow "claude-sync exited non-zero; see output above."
+    fi
+  fi
+
+  c_green "✓ Doctor pass complete."
 }
 
 # ---------------------------------------------------------------------------
@@ -1491,6 +1668,8 @@ Usage:
   $0 open [name]         launch/focus a profile (no name = default profile)
   $0 list                list known profiles (running? key captured?)
   $0 dash [port]         run the local usage dashboard (default port 8965)
+  $0 doctor              repair every profile's session-index link, check
+                         patch freshness, run claude-sync if idle
   $0 install             add 'claude-deck' shortcut to ~/.zshrc
   $0 uninstall           remove the 'claude-deck' shortcut from ~/.zshrc
   $0 watchdog on|off     (sudo) auto re-patch after Claude updates
@@ -1521,6 +1700,7 @@ case "$SUBCOMMAND" in
   open)           cmd_open "$@" ;;
   list)           cmd_list ;;
   dash)           cmd_dash "$@" ;;
+  doctor)         cmd_doctor ;;
   install)        cmd_install ;;
   uninstall)      cmd_uninstall ;;
   watchdog)       cmd_watchdog "$@" ;;
