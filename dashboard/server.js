@@ -6,8 +6,9 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 
+const IS_WIN = process.platform === 'win32';
 const PORT = Number(process.env.CLAUDE_DECK_PORT) || Number(process.argv[2]) || 8965;
 const MOCK = process.env.CLAUDE_DECK_MOCK === '1';
 const PROFILES_DIR = path.join(os.homedir(), '.claude-deck', 'profiles');
@@ -135,19 +136,21 @@ function writePins(list) {
   return out;
 }
 
-// Locates claude-deck.sh so handleOpen can shell out to `open <name>` and
-// pick up its self-healing session-index link (ensure_profile_index_link)
-// instead of only ever calling macOS `open` directly. Checked in priority
-// order: the canonical installed copy first, then the repo copy that sits
-// next to this dashboard/ directory (covers running the dashboard straight
-// from a git checkout, without `claude-deck install`). Returns null if
-// neither exists, so the caller can fall back to the old direct-open path.
+// Locates the claude-deck script so handleOpen can shell out to `open
+// <name>` and pick up its self-healing session-index link instead of only
+// ever launching the app directly. Checked in priority order: the canonical
+// installed copy first, then the repo copy that sits next to this
+// dashboard/ directory (covers running the dashboard straight from a git
+// checkout, without `claude-deck install`). Returns null if neither exists,
+// so the caller can fall back to the direct-launch path. On Windows the
+// script is claude-deck.ps1; on macOS it is claude-deck.sh.
 let _cachedScriptPath;
 function findClaudeDeckScript() {
   if (_cachedScriptPath !== undefined) return _cachedScriptPath;
+  const scriptName = IS_WIN ? 'claude-deck.ps1' : 'claude-deck.sh';
   const candidates = [
-    path.join(os.homedir(), '.claude-deck', 'bin', 'claude-deck.sh'),
-    path.join(__dirname, '..', 'claude-deck.sh'),
+    path.join(os.homedir(), '.claude-deck', 'bin', scriptName),
+    path.join(__dirname, '..', scriptName),
   ];
   for (const candidate of candidates) {
     try {
@@ -165,6 +168,32 @@ function findClaudeDeckScript() {
 
 function getRunningProfiles() {
   return new Promise((resolve) => {
+    if (IS_WIN) {
+      // Every Electron child process is also claude.exe on Windows, but
+      // children always carry --type=<something> and never --profile=, so
+      // filtering out --type= leaves one main process per running instance.
+      execFile(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-Command',
+          "Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | ForEach-Object { $_.CommandLine }",
+        ],
+        { maxBuffer: 4 * 1024 * 1024, windowsHide: true },
+        (err, stdout) => {
+          if (err || !stdout) return resolve(new Set());
+          const running = new Set();
+          for (const line of stdout.split(/\r?\n/)) {
+            if (!/claude\.exe/i.test(line)) continue;
+            if (line.includes('--type=')) continue;
+            const match = line.match(/--profile=([A-Za-z0-9_-]{1,32})/);
+            running.add(match ? match[1] : 'default');
+          }
+          resolve(running);
+        }
+      );
+      return;
+    }
     execFile('ps', ['ax', '-o', 'command'], { maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
       if (err || !stdout) return resolve(new Set());
       const running = new Set();
@@ -181,6 +210,33 @@ function getRunningProfiles() {
       resolve(running);
     });
   });
+}
+
+// Newest Windows Claude install dir (%LOCALAPPDATA%\AnthropicClaude\app-*),
+// used only as the direct-launch fallback when no claude-deck.ps1 is found.
+function findClaudeExeWin() {
+  try {
+    const root = path.join(process.env.LOCALAPPDATA || '', 'AnthropicClaude');
+    const dirs = fs
+      .readdirSync(root)
+      .filter((d) => d.startsWith('app-'))
+      .sort((a, b) => {
+        const pa = a.slice(4).split('.').map(Number);
+        const pb = b.slice(4).split('.').map(Number);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+          const diff = (pa[i] || 0) - (pb[i] || 0);
+          if (diff) return diff;
+        }
+        return 0;
+      });
+    for (let i = dirs.length - 1; i >= 0; i--) {
+      const exe = path.join(root, dirs[i], 'claude.exe');
+      if (fs.existsSync(exe)) return exe;
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
 }
 
 function fetchJson(url, cookie) {
@@ -646,30 +702,55 @@ function handleOpen(req, res) {
 
     const running = await getRunningProfiles();
     if (running.has(name)) {
-      // Already running: best-effort activate instead of spawning a duplicate.
+      // Already running: never spawn a duplicate on the same userData dir.
+      if (IS_WIN) {
+        // No reliable cross-window activate on Windows without extra deps.
+        return sendJson(res, 200, { ok: true, activated: true });
+      }
       execFile('osascript', ['-e', 'tell application "Claude" to activate'], () => {
         sendJson(res, 200, { ok: true, activated: true });
       });
       return;
     }
 
-    // Prefer routing through claude-deck.sh's own `open` subcommand (for BOTH
-    // named profiles and default), so a dashboard-initiated launch reuses the
-    // exact CLI logic: self-heals the session-index symlink for named
-    // profiles, and forces a fresh instance for a not-running default. Falls
-    // back to a direct `open` if no installed script is found.
+    // Prefer routing through the claude-deck script's own `open` subcommand
+    // (for BOTH named profiles and default), so a dashboard-initiated launch
+    // reuses the exact CLI logic: self-heals the session-index link for
+    // named profiles, and forces a fresh instance for a not-running default.
+    // Falls back to a direct launch if no installed script is found.
     const script = findClaudeDeckScript();
     if (script) {
-      return execFile('/bin/bash', [script, 'open', name], (err) => {
+      const cmd = IS_WIN ? 'powershell.exe' : '/bin/bash';
+      const cmdArgs = IS_WIN
+        ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, 'open', name]
+        : [script, 'open', name];
+      return execFile(cmd, cmdArgs, { windowsHide: true }, (err) => {
         if (err) return sendJson(res, 500, { ok: false, error: 'failed to launch Claude' });
         sendJson(res, 200, { ok: true });
       });
     }
 
-    // Fallback (no script): reached only when the profile is NOT running (the
-    // running check above returned early). A not-running default still needs
-    // -n to force a new instance, otherwise `open -a Claude` just focuses
-    // whatever profiled instance is already up and default never launches.
+    if (IS_WIN) {
+      // Fallback (no script): launch the newest installed claude.exe
+      // directly, detached (waiting for the app to exit would hang this
+      // response forever).
+      const exe = findClaudeExeWin();
+      if (!exe) return sendJson(res, 500, { ok: false, error: 'Claude install not found' });
+      const exeArgs = name === 'default' ? [] : ['--profile=' + name];
+      try {
+        const child = spawn(exe, exeArgs, { detached: true, stdio: 'ignore' });
+        child.unref();
+        return sendJson(res, 200, { ok: true });
+      } catch (e) {
+        return sendJson(res, 500, { ok: false, error: 'failed to launch Claude' });
+      }
+    }
+
+    // Fallback (no script, macOS): reached only when the profile is NOT
+    // running (the running check above returned early). A not-running
+    // default still needs -n to force a new instance, otherwise `open -a
+    // Claude` just focuses whatever profiled instance is already up and
+    // default never launches.
     const args =
       name === 'default'
         ? ['-n', '-a', 'Claude']

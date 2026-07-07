@@ -879,7 +879,7 @@ _backup_unpacked_dir() {
 _write_injector() {
   local out="$1"
   cat > "$out" <<'JS'
-// Injected by claude-deck.sh: adds --profile=NAME support so multiple
+// Injected by claude-deck: adds --profile=NAME support so multiple
 // Claude accounts can run simultaneously, each with its own userData dir,
 // and reports each profile's session key locally for the usage dashboard.
 // Everything here is wrapped defensively: this module must never be able
@@ -891,6 +891,13 @@ const os = require('os');
 
 function safeRun(fn) {
   try { fn(); } catch (e) { /* never let injected code crash the app */ }
+}
+
+// Directory links: junctions on Windows (they work without admin rights or
+// Developer Mode, unlike real directory symlinks), plain symlinks elsewhere.
+function linkDir(target, linkPath) {
+  if (process.platform === 'win32') fs.symlinkSync(target, linkPath, 'junction');
+  else fs.symlinkSync(target, linkPath);
 }
 
 function getProfileArg() {
@@ -969,14 +976,14 @@ safeRun(function () {
       fs.renameSync(mine, mine + '.migrated-' + Date.now());
     });
     safeRun(function () {
-      fs.symlinkSync(shared, mine);
+      linkDir(shared, mine);
     });
     return;
   }
 
   if (!mineStat) {
     // Nothing at all yet for this profile: just point it at the shared dir.
-    safeRun(function () { fs.symlinkSync(shared, mine); });
+    safeRun(function () { linkDir(shared, mine); });
   }
 });
 

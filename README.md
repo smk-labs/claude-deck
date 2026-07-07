@@ -1,6 +1,6 @@
 # claude-deck
 
-**Run many Claude accounts side by side on one Mac.** A profile launcher and usage dashboard for the Claude Desktop app.
+**Run many Claude accounts side by side on one Mac or Windows PC.** A profile launcher and usage dashboard for the Claude Desktop app.
 
 ![dashboard](docs/screenshot.png)
 
@@ -21,10 +21,23 @@
 
 ## Quick start
 
+macOS:
+
 ```bash
 git clone https://github.com/SMKeramati/claude-deck.git
 cd claude-deck
 ./claude-deck.sh install
+claude-deck patch
+claude-deck open work   # log in
+claude-deck dash
+```
+
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/SMKeramati/claude-deck.git
+cd claude-deck
+.\claude-deck.ps1 install
 claude-deck patch
 claude-deck open work   # log in
 claude-deck dash
@@ -49,7 +62,9 @@ Open `http://localhost:8965` to see the dashboard.
 | `claude-deck doctor` | Repair every profile's session-index link, check the installed patch is current, run claude-sync if Claude is closed. |
 | `claude-deck install` | Copy the script to `~/.claude-deck/` and add the `claude-deck` alias. |
 | `claude-deck uninstall` | Remove the alias only (does not revert the patch). |
-| `claude-deck watchdog on\|off` | Auto-reapply the patch whenever Claude updates (needs sudo). |
+| `claude-deck watchdog on\|off` | Auto-reapply the patch whenever Claude updates (macOS only, needs sudo). |
+
+The same commands work on Windows via `claude-deck.ps1` (except `watchdog`, see the Windows section).
 
 **Claude must be quit** before `patch` or `revert` (the script tries to quit it for you).
 
@@ -75,6 +90,20 @@ To see Claude Code sessions **across different accounts**, use the companion too
 **Self-healing.** The index link no longer depends on the app patch being current: every `claude-deck open <name>` (and every open from the dashboard) repairs or creates the profile's session-index link before launching, and `claude-deck dash` repairs all profiles at startup. If something still looks off, run `claude-deck doctor`: it fixes every profile's link in one pass, tells you if the installed patch carries an outdated injection, and runs claude-sync for you when Claude is closed.
 
 > If you're updating claude-deck from an older version, run `claude-deck patch --force` once so this fix takes effect.
+
+---
+
+## Windows
+
+`claude-deck.ps1` is the Windows twin of the macOS script: same commands, same dashboard, same safety model (pristine backup, rollback on failure, unpacked-native-module preservation). Differences that matter:
+
+- **No admin rights needed.** Claude installs into `%LOCALAPPDATA%\AnthropicClaude\app-<version>\`, which your user account owns. There is also no code signing or `Info.plist` hash to fix on Windows: only `app.asar` is modified, never `claude.exe`.
+- **Integrity-fuse preflight.** On Windows, Electron's asar-integrity hash lives inside the signed `claude.exe` and only gets checked when a build-time fuse is on. The script reads that fuse first and refuses to patch (touching nothing) if it's enabled, because a modified asar would then stop Claude from starting. Today's Claude builds ship with it off.
+- **App updates install a whole new `app-<version>` folder,** so the patch disappears after every Claude update. Your logins and profiles survive (they live in `%APPDATA%\Claude Profiles\` and `~\.claude-deck\`). Re-run `claude-deck patch` after an update; there is no watchdog on Windows yet, but `claude-deck doctor` tells you when a re-patch is needed.
+- **Profiles use directory junctions** (not symlinks) for the shared Claude Code session index, because junctions need no admin rights or Developer Mode.
+- `install` adds a `claude-deck` function to your PowerShell profile; open a new terminal after running it.
+
+State lives in `%USERPROFILE%\.claude-deck\` with the same layout as macOS (`backup/`, `profiles/`, `tool/`, `node/`).
 
 ---
 
