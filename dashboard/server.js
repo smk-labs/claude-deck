@@ -60,6 +60,14 @@ function groupFor(key) {
   return 'other';
 }
 
+// Team orgs all report the same tier string, so the seat tier (from
+// bootstrap) is what tells a premium seat from a standard one.
+function planLabelFor(org, seatTier) {
+  if (seatTier === 'team_tier_1') return 'Team premium';
+  if (seatTier === 'team_standard') return 'Team standard';
+  return planFor(org);
+}
+
 function planFor(org) {
   if (!org || typeof org !== 'object') return null;
   const fields = ['rate_limit_tier', 'billing_tier', 'plan', 'subscription'];
@@ -297,13 +305,44 @@ function findEmail(node, depth) {
   return null;
 }
 
-async function fetchEmail(sessionKey) {
+// Bootstrap is the only place a Team org's seat tier lives: the org object
+// itself reports the same rate_limit_tier ("default_raven") for every seat,
+// but account.memberships[].seat_tier distinguishes team_tier_1 (premium)
+// from team_standard. Verified against the live API.
+async function fetchBootstrapInfo(sessionKey) {
   try {
     const bootstrap = await fetchJson('https://claude.ai/api/bootstrap', sessionKey);
-    return findEmail(bootstrap, 0);
+    const seatTiers = {};
+    const memberships =
+      bootstrap && bootstrap.account && Array.isArray(bootstrap.account.memberships)
+        ? bootstrap.account.memberships
+        : [];
+    for (const m of memberships) {
+      if (m && m.organization && m.organization.uuid && m.seat_tier) {
+        seatTiers[m.organization.uuid] = m.seat_tier;
+      }
+    }
+    return { email: findEmail(bootstrap, 0), seatTiers };
   } catch (e) {
-    return null;
+    return { email: null, seatTiers: {} };
   }
+}
+
+// Weekly-capacity multiplier relative to Pro (1x). Free is 0 so the client
+// can drop those orgs from up-next. null = unknown tier (client treats as 1x
+// and never filters it out).
+function multiplierFor(org, seatTier) {
+  const tier = String((org && org.rate_limit_tier) || '').toLowerCase();
+  if (tier.indexOf('max_20x') !== -1) return 20;
+  if (tier.indexOf('max_5x') !== -1) return 5;
+  if (tier === 'default_raven' || (org && org.raven_type === 'team')) {
+    if (seatTier === 'team_tier_1') return 6.25;
+    if (seatTier === 'team_standard') return 1.25;
+    return 1.25;
+  }
+  if (tier.indexOf('pro') !== -1) return 1;
+  if (tier === 'default_claude_ai') return 0;
+  return null;
 }
 
 // Replaces the old single-org ensureOrgId: a single login can belong to
@@ -312,7 +351,12 @@ async function fetchEmail(sessionKey) {
 async function ensureAccount(name, profile) {
   const cachedOrgs = Array.isArray(profile.orgs) ? profile.orgs : null;
   const fetchedAt = profile.orgsFetchedAt ? new Date(profile.orgsFetchedAt).getTime() : 0;
-  const isFresh = cachedOrgs && cachedOrgs.length > 0 && Date.now() - fetchedAt < ORGS_MAX_AGE_MS;
+  const isFresh =
+    cachedOrgs &&
+    cachedOrgs.length > 0 &&
+    Date.now() - fetchedAt < ORGS_MAX_AGE_MS &&
+    // Cache written before multiplier existed: refetch so it gets one.
+    cachedOrgs.every((o) => o.multiplier !== undefined);
 
   if (isFresh) {
     return { orgs: cachedOrgs, email: profile.email || null };
@@ -327,11 +371,20 @@ async function ensureAccount(name, profile) {
       (o) => !Array.isArray(o.capabilities) || o.capabilities.includes('chat')
     );
     const kept = chatCapable.length ? chatCapable : list;
+    const boot = await fetchBootstrapInfo(profile.sessionKey);
     orgs = kept
       .filter((o) => o && o.uuid)
-      .map((o) => ({ id: o.uuid, name: o.name || o.uuid, plan: planFor(o) }));
+      .map((o) => {
+        const seatTier = boot.seatTiers[o.uuid] || null;
+        return {
+          id: o.uuid,
+          name: o.name || o.uuid,
+          plan: planLabelFor(o, seatTier),
+          multiplier: multiplierFor(o, seatTier),
+        };
+      });
     if (!orgs.length) throw new Error('no organization found for this account');
-    email = await fetchEmail(profile.sessionKey);
+    email = boot.email;
   } catch (e) {
     // A failed refetch must not wipe a cached list: fall back to it if present.
     if (cachedOrgs && cachedOrgs.length) {
@@ -442,9 +495,9 @@ async function fetchUsageForOrg(org, sessionKey) {
       sessionKey
     );
     const windows = normalizeUsage(raw);
-    return { id: org.id, name: org.name, plan: org.plan, ok: true, windows };
+    return { id: org.id, name: org.name, plan: org.plan, multiplier: org.multiplier !== undefined ? org.multiplier : null, ok: true, windows };
   } catch (e) {
-    return { id: org.id, name: org.name, plan: org.plan, ok: false, error: e.message };
+    return { id: org.id, name: org.name, plan: org.plan, multiplier: org.multiplier !== undefined ? org.multiplier : null, ok: false, error: e.message };
   }
 }
 
@@ -456,7 +509,7 @@ async function fetchUsageForProfile(name, profile) {
   const orgResults = results.map((r, i) => {
     if (r.status === 'fulfilled') return r.value;
     const org = orgs[i];
-    return { id: org.id, name: org.name, plan: org.plan, ok: false, error: String((r.reason && r.reason.message) || r.reason || 'unknown error') };
+    return { id: org.id, name: org.name, plan: org.plan, multiplier: org.multiplier !== undefined ? org.multiplier : null, ok: false, error: String((r.reason && r.reason.message) || r.reason || 'unknown error') };
   });
   return { name, email, running: false, ok: true, orgs: orgResults };
 }
@@ -477,7 +530,8 @@ const MOCK_FIXTURES = [
       {
         id: 'org-partnerz',
         name: 'Partnerz',
-        plan: 'Team',
+        plan: 'Team premium',
+        multiplier: 6.25,
         raw: {
           five_hour: { utilization: 45, resets_hrs: 2.02 },
           seven_day: { utilization: 15, resets_hrs: 96 },
@@ -487,7 +541,8 @@ const MOCK_FIXTURES = [
       {
         id: 'org-partnerz-2',
         name: 'Partnerz-2',
-        plan: 'Team',
+        plan: 'Team standard',
+        multiplier: 1.25,
         // Headroom trap: session is wide open (8%) and "All models" is fine
         // (30%), but the scoped Fable limit is maxed at 100%. Proves the
         // headroom predicate looks at EVERY weekly bucket, not just the
@@ -501,7 +556,8 @@ const MOCK_FIXTURES = [
       {
         id: 'org-personal',
         name: 'Personal',
-        plan: 'Max',
+        plan: 'Max (20x)',
+        multiplier: 20,
         raw: {
           five_hour: { utilization: 93, resets_hrs: 0.68 },
           seven_day: { utilization: 81, resets_hrs: 40 },
@@ -521,6 +577,7 @@ const MOCK_FIXTURES = [
         id: 'org-research',
         name: 'Research Co',
         plan: 'Pro',
+        multiplier: 1,
         raw: {
           five_hour: { utilization: 12, resets_hrs: 4.5 },
           // Default (neutral) tier fixture: weekly reset ~2d out (48h+).
@@ -538,6 +595,7 @@ const MOCK_FIXTURES = [
         id: 'org-client-a',
         name: 'Client A',
         plan: null,
+        multiplier: null,
         raw: {
           five_hour: { utilization: 5, resets_hrs: 1.1 },
           // Red tier fixture: weekly reset ~3h out (under 4h, use-it-or-lose-it).
@@ -589,7 +647,7 @@ function mockUsage() {
     }
     const orgs = f.orgs.map((org) => {
       if (org.error) {
-        return { id: org.id, name: org.name, plan: org.plan, ok: false, error: org.error };
+        return { id: org.id, name: org.name, plan: org.plan, multiplier: org.multiplier !== undefined ? org.multiplier : null, ok: false, error: org.error };
       }
       // Build the real dual shape: legacy flat keys AND the canonical `limits`
       // array the live API returns (and the app renders). normalizeUsage
@@ -612,7 +670,7 @@ function mockUsage() {
       }
       rawWithTimestamps.limits = limits;
       const windows = normalizeUsage(rawWithTimestamps);
-      return { id: org.id, name: org.name, plan: org.plan, ok: true, windows };
+      return { id: org.id, name: org.name, plan: org.plan, multiplier: org.multiplier !== undefined ? org.multiplier : null, ok: true, windows };
     });
     return { name: f.name, email: f.email, running: f.running, ok: true, orgs: orgs };
   });

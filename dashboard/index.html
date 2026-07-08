@@ -624,6 +624,7 @@
   <div class="sort-control">
     <label for="sort-select">Sort:</label>
     <select class="sort-select" id="sort-select">
+      <option value="best-value">Best value first</option>
       <option value="weekly-reset-soonest">Weekly reset: soonest</option>
       <option value="session-used-asc">Session used: low to high</option>
       <option value="session-used-desc">Session used: high to low</option>
@@ -715,7 +716,7 @@
   var FILTER_KEY = 'claude-deck-filter';
   var PINS_KEY = 'claude-deck-pins';
   var UP_NEXT_MAX = 10;
-  var VALID_SORTS = ['weekly-reset-soonest', 'session-used-asc', 'session-used-desc', 'weekly-used-asc', 'weekly-used-desc', 'name'];
+  var VALID_SORTS = ['best-value', 'weekly-reset-soonest', 'session-used-asc', 'session-used-desc', 'weekly-used-asc', 'weekly-used-desc', 'name'];
   var VALID_FILTERS = ['all', 'available', 'headroom', 'running'];
 
   function loadPref(key, valid, fallback) {
@@ -780,7 +781,7 @@
     usage: {},
     fetchedAt: null,
     loading: true,
-    sort: loadPref(SORT_KEY, VALID_SORTS, 'weekly-reset-soonest'),
+    sort: loadPref(SORT_KEY, VALID_SORTS, 'best-value'),
     filter: loadPref(FILTER_KEY, VALID_FILTERS, 'all'),
     pins: loadPins(),
     cursor: []
@@ -1183,6 +1184,22 @@
     return Math.max.apply(null, weeklyWindows.map(function (w) { return w.utilization; }));
   }
 
+  // "Best value" score: how much real weekly capacity is burning per hour
+  // if this org sits unused. multiplier is the plan's weekly capacity
+  // relative to Pro (server-derived: 20 / 6.25 / 5 / 1.25 / 1; 0 = free plan,
+  // null = unknown, treated as 1x). Session above 50% halves the score:
+  // a penalty, not a disqualifier.
+  function orgValueScore(org, sessionPct, maxWeeklyPct, resetsAtMs) {
+    var mult = typeof org.multiplier === 'number' ? org.multiplier : 1;
+    if (mult === 0) return 0;
+    var hoursLeft = resetsAtMs === null
+      ? 168
+      : Math.max((resetsAtMs - Date.now()) / 3600000, 1);
+    var score = (mult * (100 - maxWeeklyPct)) / hoursLeft;
+    if (sessionPct > 50) score *= 0.5;
+    return score;
+  }
+
   // "Has headroom": not blocked on session, and not maxed on ANY weekly
   // bucket (including a scoped per-model limit like Fable). This is the
   // use-it-or-lose-it check: a maxed weekly bucket is dead weight even if
@@ -1202,7 +1219,8 @@
       weeklyUsedMin: null,
       weeklyUsedMax: null,
       availableNow: false,
-      hasHeadroom: false
+      hasHeadroom: false,
+      bestScore: null
     };
     if (!m.hasData) return m;
 
@@ -1215,14 +1233,19 @@
       if (sessionPct < 90) m.availableNow = true;
       if (orgHasHeadroom(org)) m.hasHeadroom = true;
 
+      var orgEarliestReset = null;
       orgWeeklyWindows(org).forEach(function (w) {
         if (m.weeklyUsedMin === null || w.utilization < m.weeklyUsedMin) m.weeklyUsedMin = w.utilization;
         if (m.weeklyUsedMax === null || w.utilization > m.weeklyUsedMax) m.weeklyUsedMax = w.utilization;
         if (w.resetsAt) {
           var t = new Date(w.resetsAt).getTime();
           if (m.minWeeklyReset === null || t < m.minWeeklyReset) m.minWeeklyReset = t;
+          if (orgEarliestReset === null || t < orgEarliestReset) orgEarliestReset = t;
         }
       });
+
+      var score = orgValueScore(org, sessionPct, orgMaxWeeklyUtilization(org), orgEarliestReset);
+      if (m.bestScore === null || score > m.bestScore) m.bestScore = score;
     });
     return m;
   }
@@ -1256,6 +1279,8 @@
       if (!a.m.hasData && !b.m.hasData) return a.i - b.i;
 
       switch (state.sort) {
+        case 'best-value':
+          return (b.m.bestScore === null ? -Infinity : b.m.bestScore) - (a.m.bestScore === null ? -Infinity : a.m.bestScore);
         case 'session-used-asc':
           return (a.m.sessionMin === null ? Infinity : a.m.sessionMin) - (b.m.sessionMin === null ? Infinity : b.m.sessionMin);
         case 'session-used-desc':
@@ -1311,6 +1336,8 @@
       if (!hasUsageData(usage)) return;
       (usage.orgs || []).forEach(function (org) {
         if (!org.ok) return;
+        // Free plans have no capacity worth surfacing in up-next.
+        if (org.multiplier === 0) return;
         var weeklyWindows = orgWeeklyWindows(org);
         if (!weeklyWindows.length) return;
         var sessionPct = orgSessionUtilization(org);
@@ -1321,19 +1348,24 @@
           var t = new Date(w.resetsAt).getTime();
           if (earliest === null || t < earliest.t) earliest = { t: t, iso: w.resetsAt };
         });
+        var maxWeeklyPct = orgMaxWeeklyUtilization(org);
+        var resetsAtMs = earliest ? earliest.t : null;
         candidates.push({
           profile: profile,
           org: org,
           sessionPct: sessionPct,
-          maxWeeklyPct: orgMaxWeeklyUtilization(org),
+          maxWeeklyPct: maxWeeklyPct,
           resetsAt: earliest ? earliest.iso : null,
-          resetsAtMs: earliest ? earliest.t : null
+          resetsAtMs: resetsAtMs,
+          score: orgValueScore(org, sessionPct, maxWeeklyPct, resetsAtMs)
         });
       });
     });
 
     candidates.sort(function (a, b) {
       switch (state.sort) {
+        case 'best-value':
+          return b.score - a.score;
         case 'session-used-asc':
           return a.sessionPct - b.sessionPct;
         case 'session-used-desc':
