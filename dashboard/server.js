@@ -7,15 +7,22 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFile, spawn } = require('child_process');
+const cursor = require('./cursor.js');
 
 const IS_WIN = process.platform === 'win32';
-const PORT = Number(process.env.CLAUDE_DECK_PORT) || Number(process.argv[2]) || 8965;
+// Port precedence: explicit CLAUDE_DECK_PORT, then a positional arg, then the
+// conventional PORT env (honored by PaaS hosts and preview harnesses), then the
+// 8965 default. PORT sits last so it never overrides an explicit choice.
+const PORT =
+  Number(process.env.CLAUDE_DECK_PORT) || Number(process.argv[2]) || Number(process.env.PORT) || 8965;
 const MOCK = process.env.CLAUDE_DECK_MOCK === '1';
 const PROFILES_DIR = path.join(os.homedir(), '.claude-deck', 'profiles');
 const INDEX_HTML = path.join(__dirname, 'index.html');
 
 const USAGE_CACHE = new Map(); // name -> { at, data }
 const CACHE_MS = 120 * 1000;
+
+let CURSOR_CACHE = null; // { at, data } for the /api/cursor response
 
 const CHROME_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
@@ -674,6 +681,62 @@ async function handleUsage(req, res, query) {
   sendJson(res, 200, { fetchedAt: new Date().toISOString(), profiles });
 }
 
+// Cursor accounts are a separate resource from Claude profiles (different
+// vendor, different auth, no launch/pin semantics), so they get their own
+// route and their own dashboard section rather than being folded into the
+// Claude profile list. Cached like usage, and cheap-first: an empty account
+// list (nobody configured any, no Cursor install) returns [] so the UI can
+// simply hide the section.
+async function handleCursor(req, res, query) {
+  if (MOCK) return sendJson(res, 200, { fetchedAt: new Date().toISOString(), accounts: cursor.mockCursorAccounts() });
+
+  const fresh = query.get('fresh') === '1';
+  if (!fresh && CURSOR_CACHE && Date.now() - CURSOR_CACHE.at < CACHE_MS) {
+    return sendJson(res, 200, CURSOR_CACHE.data);
+  }
+  const accounts = await cursor.fetchCursorAccounts();
+  const data = { fetchedAt: new Date().toISOString(), accounts };
+  CURSOR_CACHE = { at: Date.now(), data };
+  sendJson(res, 200, data);
+}
+
+// Open (or focus) a Cursor account's window. Mirrors handleOpen for Claude
+// profiles: named accounts launch with their --user-data-dir, the default
+// install launches plain. `open -na` on an already-running profile hands off
+// to that instance's lock and focuses it, so one code path covers both.
+function handleCursorOpen(req, res) {
+  let body = '';
+  let tooLarge = false;
+  req.on('data', (chunk) => {
+    body += chunk;
+    if (body.length > 1024) { tooLarge = true; req.destroy(); }
+  });
+  req.on('end', () => {
+    if (tooLarge) return sendJson(res, 413, { ok: false, error: 'body too large' });
+    if (MOCK) return sendJson(res, 200, { ok: true });
+    if (IS_WIN) return sendJson(res, 501, { ok: false, error: 'not supported on Windows yet' });
+
+    let parsed;
+    try { parsed = JSON.parse(body || '{}'); } catch (e) {
+      return sendJson(res, 400, { ok: false, error: 'invalid JSON' });
+    }
+    const label = parsed.label;
+    if (!validName(label)) return sendJson(res, 400, { ok: false, error: 'invalid account label' });
+
+    const acct = cursor.readAccountsConfig().find((a) => a.label === label && a.mode === 'token');
+    if (!acct || !acct.userDataDir) return sendJson(res, 404, { ok: false, error: 'unknown Cursor account' });
+
+    const isDefaultDir = path.resolve(acct.userDataDir) === path.resolve(cursor.defaultCursorUserData());
+    const args = isDefaultDir
+      ? ['-a', 'Cursor']
+      : ['-na', 'Cursor', '--args', '--user-data-dir', acct.userDataDir];
+    execFile('open', args, (err) => {
+      if (err) return sendJson(res, 500, { ok: false, error: 'failed to launch Cursor' });
+      sendJson(res, 200, { ok: true });
+    });
+  });
+}
+
 function handleOpen(req, res) {
   let body = '';
   let tooLarge = false;
@@ -809,6 +872,11 @@ const server = http.createServer((req, res) => {
       sendJson(res, 500, { error: String(e.message || e) })
     );
   }
+  if (req.method === 'GET' && url.pathname === '/api/cursor') {
+    return handleCursor(req, res, url.searchParams).catch((e) =>
+      sendJson(res, 500, { error: String(e.message || e) })
+    );
+  }
   if (req.method === 'GET' && url.pathname === '/api/pins') {
     return sendJson(res, 200, { pins: readPins() });
   }
@@ -832,6 +900,12 @@ const server = http.createServer((req, res) => {
       sendJson(res, 200, { ok: true, pins });
     });
     return;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/cursor/open') {
+    if (req.headers['x-claude-deck'] !== '1') {
+      return sendJson(res, 403, { ok: false, error: 'forbidden' });
+    }
+    return handleCursorOpen(req, res);
   }
   if (req.method === 'POST' && url.pathname === '/api/open') {
     // State-changing route: also require a custom header the dashboard page

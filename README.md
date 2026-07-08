@@ -16,6 +16,7 @@
 - **Every profile shares the same `~/.claude`.** Claude Code sessions, config, and settings are identical across every account you log into.
 - **A local dashboard** showing usage per account AND per organization (an account in several orgs gets one section per org), rendering usage windows dynamically from whatever the API returns, so new model buckets (like a Fable weekly limit) show up automatically with no code change, with one-click open or focus per profile.
 - **Window titles tagged `[profile]`** so Cmd-backtick, Mission Control, and Raycast can tell your accounts apart.
+- **Optional Cursor integration.** See idle [Cursor](https://cursor.com) seats' usage in the same dashboard, and delegate self-contained tasks to them from Claude Code (agent calling). Zero dependency, off by default. See [Cursor accounts](#cursor-accounts-optional).
 
 ---
 
@@ -90,6 +91,33 @@ To see Claude Code sessions **across different accounts**, use the companion too
 **Self-healing.** The index link no longer depends on the app patch being current: every `claude-deck open <name>` (and every open from the dashboard) repairs or creates the profile's session-index link before launching, and `claude-deck dash` repairs all profiles at startup. If something still looks off, run `claude-deck doctor`: it fixes every profile's link in one pass, tells you if the installed patch carries an outdated injection, and runs claude-sync for you when Claude is closed.
 
 > If you're updating claude-deck from an older version, run `claude-deck patch --force` once so this fix takes effect.
+
+---
+
+## Cursor accounts (optional)
+
+claude-deck can also surface idle **[Cursor](https://cursor.com)** seats, in two independent ways. Both are off by default and touch nothing in the patch flow.
+
+### See Cursor usage in the dashboard
+
+The dashboard shows a **Cursor accounts** section beside your Claude profiles: plan tier, whether the login is still alive, and monthly usage where available. It reads each account's token straight from Cursor's own on-disk store (`state.vscdb`, opened read-only) with the `sqlite3` that ships with macOS, so there's no dependency and no new credential. An idle account whose token has aged out shows "open Cursor once to refresh", exactly like the Claude expired-key flow: claude-deck never touches Cursor's refresh token, so it can't log the account out.
+
+Zero-config for a single Cursor install (auto-discovered). For several accounts, list them in `~/.claude-deck/cursor/accounts.json`:
+
+```json
+{ "accounts": [
+  { "label": "tech-sub", "userDataDir": "~/Library/Application Support/Cursor" },
+  { "label": "design",   "userDataDir": "~/CursorProfiles/design" }
+] }
+```
+
+Run each Cursor account in its own login the VS Code way: `open -na Cursor --args --user-data-dir ~/CursorProfiles/design`. Each gets its own `state.vscdb`, so the dashboard reads them all.
+
+### Delegate work to Cursor from Claude Code
+
+Put those seats to work: Claude Code (terminal or the Desktop Code tab) can hand a self-contained slice to `cursor-agent`, which runs it on the Cursor subscription's quota instead of Claude's. Claude stays the orchestrator. See [`integrations/claude-code/`](integrations/claude-code/) for a skill, a subagent, and an optional MCP tool, plus a one-command installer.
+
+This is **agent calling, not a model-backend swap**: Cursor sells no Anthropic-shaped API for its subscription, and the Desktop Code tab always uses your claude.ai account, so you can't point Claude's engine at Cursor. You can run the two side by side, which is what this does.
 
 ---
 

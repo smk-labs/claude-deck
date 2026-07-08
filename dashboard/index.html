@@ -466,6 +466,23 @@
   .fill.danger { background: var(--red); }
   .resets { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
+  /* Cursor accounts section: reuses .card / .window-row / .track styling, with
+     its own status dot (Cursor logins aren't "running" the way Claude windows
+     are; the dot reflects token validity instead). */
+  .cursor-section { margin-top: 40px; }
+  .cursor-section-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .cursor-section-head .upnext-label { margin-bottom: 0; }
+  .cursor-dot { width: 7px; height: 7px; border-radius: 50%; background: #B8B5AA; flex-shrink: 0; }
+  .cursor-dot.ok { background: var(--green); }
+  .cursor-dot.expired { background: var(--urgent-warning); }
+  .cursor-dot.err { background: var(--red); }
+  .cursor-note { font-size: 12.5px; color: var(--muted); }
+
   .error-state {
     display: flex;
     gap: 10px;
@@ -631,6 +648,13 @@
   <div id="content">
     <div class="grid" id="grid"></div>
   </div>
+  <section class="cursor-section" id="cursor-section" style="display:none;">
+    <div class="cursor-section-head">
+      <div class="upnext-label">Cursor accounts</div>
+      <span class="count" id="cursor-count"></span>
+    </div>
+    <div class="grid" id="cursor-grid"></div>
+  </section>
 </main>
 
 <footer>Unofficial. Not affiliated with Anthropic. Data stays on this Mac.</footer>
@@ -758,7 +782,8 @@
     loading: true,
     sort: loadPref(SORT_KEY, VALID_SORTS, 'weekly-reset-soonest'),
     filter: loadPref(FILTER_KEY, VALID_FILTERS, 'all'),
-    pins: loadPins()
+    pins: loadPins(),
+    cursor: []
   };
   var lastFetchTime = null;
 
@@ -988,6 +1013,131 @@
       card.appendChild(orgsWrap);
     }
     return card;
+  }
+
+  // ---- Cursor accounts ----
+
+  function fmtDate(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    return MONTHS[d.getMonth()] + ' ' + d.getDate();
+  }
+
+  // Cursor's usage rows can be dollar-denominated (a spend against the plan's
+  // monthly pool) or percent-only, so the right-hand value adapts. A row with
+  // no numeric utilization (unknown shape) still shows its label + reset.
+  function renderCursorWindowRow(w) {
+    var row = el('div', 'window-row');
+    var labelRow = el('div', 'window-label-row');
+    labelRow.appendChild(el('span', 'window-label', w.label));
+    var right = '';
+    if (w.usedDollars != null && w.poolDollars) right = '$' + w.usedDollars + ' / $' + w.poolDollars;
+    else if (w.utilization != null) right = w.utilization + '% used';
+    labelRow.appendChild(el('span', 'window-pct', right));
+    row.appendChild(labelRow);
+    if (w.utilization != null) {
+      var track = el('div', 'track');
+      var fill = el('div', fillClass(w.utilization));
+      fill.style.width = Math.min(100, Math.max(0, w.utilization)) + '%';
+      track.appendChild(fill);
+      row.appendChild(track);
+    }
+    if (w.detail) {
+      row.appendChild(el('div', 'resets', w.detail));
+    }
+    if (w.resetsAt) {
+      var resets = el('div', 'resets');
+      resets.dataset.resetsAt = w.resetsAt;
+      resets.dataset.group = 'weekly';
+      resets.textContent = fmtResetFor('weekly', w.resetsAt);
+      row.appendChild(resets);
+    }
+    return row;
+  }
+
+  function openCursorAccount(label, btn) {
+    btn.disabled = true;
+    var original = btn.textContent;
+    btn.textContent = '...';
+    fetch('/api/cursor/open', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Claude-Deck': '1' },
+      body: JSON.stringify({ label: label })
+    }).then(function () {
+      btn.disabled = false;
+      btn.textContent = original;
+      setTimeout(function () { loadCursor(true); }, 1500);
+    }).catch(function () {
+      btn.disabled = false;
+      btn.textContent = original;
+    });
+  }
+
+  function renderCursorCard(acct) {
+    var card = el('div', 'card');
+    var head = el('div', 'card-head');
+    var nameWrap = el('div', 'name-wrap');
+    // Green pulsing dot = a Cursor window for this account is running (same
+    // meaning as the Claude cards); token state shows via amber/red only.
+    var dotClass = acct.running ? 'dot running' : 'cursor-dot' + (acct.ok || acct.pending ? '' : (acct.expired ? ' expired' : ' err'));
+    nameWrap.appendChild(el('span', dotClass));
+    var nameCol = el('div', 'name-col');
+    nameCol.appendChild(el('span', 'name', acct.label));
+    if (acct.email) nameCol.appendChild(el('span', 'email', acct.email));
+    nameWrap.appendChild(nameCol);
+    head.appendChild(nameWrap);
+
+    var actions = el('div', 'card-actions');
+    if (acct.plan) actions.appendChild(el('span', 'org-plan', acct.plan));
+    if (acct.mode === 'token') {
+      var btn = el('button', 'open' + (acct.running ? ' focus' : ''), acct.running ? 'Focus' : 'Open');
+      btn.addEventListener('click', function () { openCursorAccount(acct.label, btn); });
+      actions.appendChild(btn);
+    }
+    head.appendChild(actions);
+    card.appendChild(head);
+
+    if (acct.ok) {
+      var windows = acct.windows || [];
+      if (windows.length) {
+        var wrap = el('div', 'windows');
+        windows.forEach(function (w) { wrap.appendChild(renderCursorWindowRow(w)); });
+        card.appendChild(wrap);
+      }
+      if (acct.note) {
+        card.appendChild(el('div', 'cursor-note', acct.note));
+      } else if (!windows.length) {
+        var msg = 'Connected.';
+        if (acct.tokenExpiresAt) msg += ' Login valid through ' + fmtDate(acct.tokenExpiresAt) + '.';
+        card.appendChild(el('div', 'cursor-note', msg));
+      }
+    } else {
+      var errBox = el('div', 'error-state');
+      errBox.appendChild(el('div', '', warningIcon()));
+      var textWrap = el('div');
+      textWrap.appendChild(el('div', 'msg', acct.expired ? 'Cursor login expired' : (acct.pending ? 'Not signed in yet' : 'Not available')));
+      textWrap.appendChild(el('div', 'hint', acct.error || 'unknown error'));
+      errBox.appendChild(textWrap);
+      card.appendChild(errBox);
+    }
+    return card;
+  }
+
+  function renderCursor() {
+    var section = document.getElementById('cursor-section');
+    var grid = document.getElementById('cursor-grid');
+    var count = document.getElementById('cursor-count');
+    var accounts = state.cursor || [];
+    // No Cursor accounts configured or discovered: hide the section entirely so
+    // users who don't use Cursor never see it.
+    if (!accounts.length) {
+      section.style.display = 'none';
+      return;
+    }
+    section.style.display = '';
+    count.textContent = accounts.length + (accounts.length === 1 ? ' account' : ' accounts');
+    grid.innerHTML = '';
+    accounts.forEach(function (acct) { grid.appendChild(renderCursorCard(acct)); });
   }
 
   function renderEmpty() {
@@ -1386,10 +1536,21 @@
     });
   }
 
+  function loadCursor(fresh) {
+    var url = '/api/cursor' + (fresh ? '?fresh=1' : '');
+    return fetch(url).then(function (r) { return r.json(); }).then(function (data) {
+      state.cursor = (data && Array.isArray(data.accounts)) ? data.accounts : [];
+      renderCursor();
+    }).catch(function () {
+      // Cursor is an optional extra; a failure here must never break the
+      // Claude dashboard. Leave the section as-is (hidden if never loaded).
+    });
+  }
+
   function refreshAll(fresh) {
     var btn = document.getElementById('refresh-btn');
     btn.classList.add('spinning');
-    Promise.all([loadProfiles(), loadUsage(fresh)]).then(function () {
+    Promise.all([loadProfiles(), loadUsage(fresh), loadCursor(fresh)]).then(function () {
       setTimeout(function () { btn.classList.remove('spinning'); }, 500);
     }).catch(function () {
       btn.classList.remove('spinning');
