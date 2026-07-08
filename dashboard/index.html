@@ -251,6 +251,8 @@
   }
   .upnext-pill:hover { border-color: var(--muted); transform: translateY(-1px); }
   .upnext-meta .pct-hot { color: var(--urgent-critical); font-weight: 600; }
+  .upnext-pill.cursor-pill { border-style: dashed; }
+  .upnext-pill.cursor-pill .upnext-badge { background: #B8B5AA; color: #1a1a1a; }
   .upnext-pill.top-pick { border-color: var(--accent); }
   .upnext-pill.tier-warning { border-color: var(--urgent-warning); }
   .upnext-pill.tier-critical { border-color: var(--urgent-critical); }
@@ -1189,13 +1191,16 @@
   // relative to Pro (server-derived: 20 / 6.25 / 5 / 1.25 / 1; 0 = free plan,
   // null = unknown, treated as 1x). Session above 50% halves the score:
   // a penalty, not a disqualifier.
+  // Time is raised to 1.5 so urgency outweighs raw remaining capacity: a
+  // small plan resetting in hours should beat a big plan resetting in days.
+  var TIME_WEIGHT = 1.5;
   function orgValueScore(org, sessionPct, maxWeeklyPct, resetsAtMs) {
     var mult = typeof org.multiplier === 'number' ? org.multiplier : 1;
     if (mult === 0) return 0;
     var hoursLeft = resetsAtMs === null
       ? 168
       : Math.max((resetsAtMs - Date.now()) / 3600000, 1);
-    var score = (mult * (100 - maxWeeklyPct)) / hoursLeft;
+    var score = (mult * (100 - maxWeeklyPct)) / Math.pow(hoursLeft, TIME_WEIGHT);
     if (sessionPct > 50) score *= 0.5;
     return score;
   }
@@ -1402,18 +1407,42 @@
     return candidates.slice(0, UP_NEXT_MAX);
   }
 
+  // Cursor accounts with a clear budget surplus: more of the monthly credit
+  // left than time left in the cycle (ratio above 1.25), worth delegating to.
+  // Cycle length is assumed 30 days; only the days-until-reset are exposed.
+  var CURSOR_SURPLUS_RATIO = 1.25;
+  function cursorUpNextPicks() {
+    var picks = [];
+    (state.cursor || []).forEach(function (acct) {
+      if (!acct.ok) return;
+      var best = null;
+      (acct.windows || []).forEach(function (w) {
+        if (typeof w.utilization !== 'number' || !w.resetsAt) return;
+        var daysLeft = (new Date(w.resetsAt).getTime() - Date.now()) / 86400000;
+        if (!(daysLeft > 0)) return;
+        var remainingPct = 100 - w.utilization;
+        var monthLeftPct = Math.min(100, (daysLeft / 30) * 100);
+        var ratio = remainingPct / Math.max(monthLeftPct, 1);
+        if (best === null || ratio > best.ratio) {
+          best = { ratio: ratio, remainingPct: remainingPct, resetsAt: w.resetsAt };
+        }
+      });
+      if (best && best.ratio >= CURSOR_SURPLUS_RATIO && best.remainingPct >= 15) {
+        picks.push({ acct: acct, ratio: best.ratio, remainingPct: best.remainingPct, resetsAt: best.resetsAt });
+      }
+    });
+    picks.sort(function (a, b) { return b.ratio - a.ratio; });
+    return picks.slice(0, 3);
+  }
+
   function renderUpNext() {
     var wrap = document.getElementById('upnext');
     var row = document.getElementById('upnext-row');
     row.innerHTML = '';
 
-    if (!state.profiles.length || state.loading) {
-      wrap.style.display = 'none';
-      return;
-    }
-
-    var candidates = buildUpNextCandidates();
-    if (!candidates.length) {
+    var candidates = (!state.profiles.length || state.loading) ? [] : buildUpNextCandidates();
+    var cursorPicks = cursorUpNextPicks();
+    if (!candidates.length && !cursorPicks.length) {
       wrap.style.display = 'none';
       return;
     }
@@ -1442,6 +1471,24 @@
       text.appendChild(meta);
       pill.appendChild(text);
       pill.addEventListener('click', function () { openProfile(c.profile.name, pill); });
+      row.appendChild(pill);
+    });
+
+    // Cursor surplus pills sit after the Claude ones: a reminder that this
+    // seat's monthly credit is ahead of pace and worth burning via delegation.
+    cursorPicks.forEach(function (p) {
+      var pill = el('button', 'upnext-pill cursor-pill');
+      pill.type = 'button';
+      pill.title = 'Cursor budget is ahead of pace: delegate work to this seat';
+      pill.appendChild(el('span', 'upnext-badge', monogram(p.acct.label)));
+      var text = el('div', 'upnext-text');
+      text.appendChild(el('span', 'upnext-who', p.acct.label + ' · Cursor'));
+      text.appendChild(el('span', 'upnext-meta', Math.round(p.remainingPct) + '% left · ' + fmtRemaining(p.resetsAt) + ' · delegate'));
+      pill.appendChild(text);
+      pill.addEventListener('click', function () {
+        var section = document.getElementById('cursor-section');
+        if (section) section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
       row.appendChild(pill);
     });
   }
@@ -1573,6 +1620,9 @@
     return fetch(url).then(function (r) { return r.json(); }).then(function (data) {
       state.cursor = (data && Array.isArray(data.accounts)) ? data.accounts : [];
       renderCursor();
+      // Cursor data feeds the surplus pills in Up next, which by now has
+      // usually already rendered from the (faster) Claude usage response.
+      renderUpNext();
     }).catch(function () {
       // Cursor is an optional extra; a failure here must never break the
       // Claude dashboard. Leave the section as-is (hidden if never loaded).
