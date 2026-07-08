@@ -1210,8 +1210,27 @@
   // bucket (including a scoped per-model limit like Fable). This is the
   // use-it-or-lose-it check: a maxed weekly bucket is dead weight even if
   // the session window still has room.
+  // Above 80% weekly the org is hidden too, unless every weekly bucket
+  // that is over 80% resets within 12 hours (use-it-before-it-resets);
+  // above 90% the bar tightens to a 4-hour reset.
+  var HEADROOM_TIERS = [
+    { pct: 90, resetMs: 4 * 3600000 },
+    { pct: 80, resetMs: 12 * 3600000 }
+  ];
   function orgHasHeadroom(org) {
-    return orgSessionUtilization(org) < 90 && orgMaxWeeklyUtilization(org) < 100;
+    if (orgSessionUtilization(org) >= 90) return false;
+    if (orgMaxWeeklyUtilization(org) >= 100) return false;
+    var ok = true;
+    orgWeeklyWindows(org).forEach(function (w) {
+      var tier = null;
+      for (var i = 0; i < HEADROOM_TIERS.length; i++) {
+        if (w.utilization > HEADROOM_TIERS[i].pct) { tier = HEADROOM_TIERS[i]; break; }
+      }
+      if (!tier) return;
+      var t = w.resetsAt ? new Date(w.resetsAt).getTime() : null;
+      if (t === null || t - Date.now() > tier.resetMs) ok = false;
+    });
+    return ok;
   }
 
   // Derives sort/filter keys for a profile card across all its orgs.
