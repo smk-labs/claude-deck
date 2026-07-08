@@ -250,6 +250,7 @@
     transition: border-color 150ms ease, transform 150ms ease;
   }
   .upnext-pill:hover { border-color: var(--muted); transform: translateY(-1px); }
+  .upnext-meta .pct-hot { color: var(--urgent-critical); font-weight: 600; }
   .upnext-pill.top-pick { border-color: var(--accent); }
   .upnext-pill.tier-warning { border-color: var(--urgent-warning); }
   .upnext-pill.tier-critical { border-color: var(--urgent-critical); }
@@ -1252,7 +1253,11 @@
       var whoClass = 'upnext-who' + (tier !== 'default' ? ' tier-' + tier + '-text' : '');
       text.appendChild(el('span', whoClass, c.profile.name + ' · ' + (c.org.name || 'Unknown org')));
       var metaClass = 'upnext-meta' + (tier !== 'default' ? ' tier-' + tier + '-text' : '');
-      text.appendChild(el('span', metaClass, fmtRemaining(c.resetsAt) + ' · ' + c.sessionPct + '% session'));
+      var meta = el('span', metaClass, fmtRemaining(c.resetsAt) + ' · ');
+      meta.appendChild(el('span', c.maxWeeklyPct > 80 ? 'pct-hot' : '', c.maxWeeklyPct + '% week'));
+      meta.appendChild(document.createTextNode(' · '));
+      meta.appendChild(el('span', c.sessionPct > 80 ? 'pct-hot' : '', c.sessionPct + '% session'));
+      text.appendChild(meta);
       pill.appendChild(text);
       pill.addEventListener('click', function () { openProfile(c.profile.name, pill); });
       row.appendChild(pill);
