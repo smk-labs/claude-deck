@@ -1191,9 +1191,10 @@
   // relative to Pro (server-derived: 20 / 6.25 / 5 / 1.25 / 1; 0 = free plan,
   // null = unknown, treated as 1x). Session above 50% halves the score:
   // a penalty, not a disqualifier.
-  // Time is raised to 1.5 so urgency outweighs raw remaining capacity: a
-  // small plan resetting in hours should beat a big plan resetting in days.
-  var TIME_WEIGHT = 1.5;
+  // Time is raised to a power > 1 so urgency outweighs raw remaining
+  // capacity: a small plan resetting in hours should beat a big plan
+  // resetting in days. Tuned by feel: 1.5 still ranked too much by capacity.
+  var TIME_WEIGHT = 2;
   function orgValueScore(org, sessionPct, maxWeeklyPct, resetsAtMs) {
     var mult = typeof org.multiplier === 'number' ? org.multiplier : 1;
     if (mult === 0) return 0;
