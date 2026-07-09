@@ -290,8 +290,11 @@ function fetchCursorJson(url, cookie, postBody) {
 //     planUsage: { remaining, limit,                 // cents
 //                  autoPercentUsed, apiPercentUsed, totalPercentUsed } }
 // Maps to one "Included usage" window: percent = totalPercentUsed, dollars =
-// (limit - remaining)/100 of limit/100, reset = billingCycleEnd, plus an
-// "N% Auto · N% API" detail line mirroring Cursor's own subtitle.
+// (limit - remaining)/100 of limit/100, reset = billingCycleEnd, plus two
+// indented sub-rows ("First-party models" and "API") mirroring Cursor's own
+// expanded breakdown. Sub-rows carry sub:true and no resetsAt, so the
+// dashboard renders them smaller and the Up-next pace math (which requires
+// resetsAt) never counts them.
 function normalizeCurrentPeriodUsage(raw) {
   if (!raw || typeof raw !== 'object' || !raw.planUsage || typeof raw.planUsage !== 'object') return [];
   const p = raw.planUsage;
@@ -313,8 +316,10 @@ function normalizeCurrentPeriodUsage(raw) {
     win.poolDollars = Math.round(limit) / 100;
     if (remaining != null) win.usedDollars = Math.round(limit - remaining) / 100;
   }
-  if (auto != null && api != null) win.detail = Math.round(auto) + '% Auto · ' + Math.round(api) + '% API';
-  return [win];
+  const out = [win];
+  if (auto != null) out.push({ id: 'first-party', label: 'First-party models', group: 'weekly', sub: true, utilization: Math.round(auto) });
+  if (api != null) out.push({ id: 'api', label: 'API', group: 'weekly', sub: true, utilization: Math.round(api) });
+  return out;
 }
 
 // Legacy fallback: turn whatever the old (undocumented, version-dependent)
@@ -542,7 +547,9 @@ function mockCursorAccounts() {
       ok: true,
       tokenExpiresAt: hrs(24 * 40),
       windows: [
-        { id: 'included', label: 'Included usage', group: 'weekly', utilization: 12, usedDollars: 48, poolDollars: 400, detail: '9% Auto · 3% API', resetsAt: hrs(24 * 18) },
+        { id: 'included', label: 'Included usage', group: 'weekly', utilization: 12, usedDollars: 48, poolDollars: 400, resetsAt: hrs(24 * 18) },
+        { id: 'first-party', label: 'First-party models', group: 'weekly', sub: true, utilization: 9 },
+        { id: 'api', label: 'API', group: 'weekly', sub: true, utilization: 3 },
       ],
     },
     {
