@@ -1179,6 +1179,17 @@
     return Math.max.apply(null, sessionWindows.map(function (w) { return w.utilization; }));
   }
 
+  // Reset time (ms) of the fullest session window: the one
+  // orgSessionUtilization reports. null when there is no session window
+  // (nothing running) or the payload carries no reset time.
+  function orgSessionResetMs(org) {
+    var sessionWindows = (org.windows || []).filter(function (w) { return w.group === 'session'; });
+    if (!sessionWindows.length) return null;
+    var fullest = sessionWindows[0];
+    sessionWindows.forEach(function (w) { if (w.utilization > fullest.utilization) fullest = w; });
+    return fullest.resetsAt ? new Date(fullest.resetsAt).getTime() : null;
+  }
+
   function orgWeeklyWindows(org) {
     return (org.windows || []).filter(function (w) { return w.group === 'weekly'; });
   }
@@ -1192,12 +1203,22 @@
   // "Best value" score: how much real weekly capacity is burning per hour
   // if this org sits unused. multiplier is the plan's weekly capacity
   // relative to Pro (server-derived: 20 / 6.25 / 5 / 1.25 / 1; 0 = free plan,
-  // null = unknown, treated as 1x). Session above 50% halves the score:
-  // a penalty, not a disqualifier.
+  // null = unknown, treated as 1x). Session fullness only matters relative
+  // to how much of the 5h session window is still ahead: the budget share
+  // left is compared against the time share left. Budget short of time
+  // (70% used, hours to go) means a lockout is coming, and the projected
+  // locked-out share of the window is a steep penalty. Budget ahead of
+  // time (40% left, minutes to go) is capacity about to expire unused, and
+  // earns a use-it-or-lose-it bonus. A fresh session sits exactly at
+  // neutral, so the weekly signal stays the primary ranking force.
   // Time is raised to a power > 1 so urgency outweighs raw remaining
   // capacity: a small plan resetting in hours should beat a big plan
   // resetting in days. Tuned by feel: 1.5 and 2 still ranked too much by capacity.
   var TIME_WEIGHT = 2.5;
+  var SESSION_WINDOW_HOURS = 5;
+  var SESSION_PENALTY = 1.2; // weight on the projected locked-out share
+  var SESSION_BONUS = 0.5;   // weight on the expiring-unused share
+  var SESSION_FLOOR = 0.05;  // deep penalty, never a hard disqualifier
   function orgValueScore(org, sessionPct, maxWeeklyPct, resetsAtMs) {
     var mult = typeof org.multiplier === 'number' ? org.multiplier : 1;
     if (mult === 0) return 0;
@@ -1205,7 +1226,17 @@
       ? 168
       : Math.max((resetsAtMs - Date.now()) / 3600000, 1);
     var score = (mult * (100 - maxWeeklyPct)) / Math.pow(hoursLeft, TIME_WEIGHT);
-    if (sessionPct > 50) score *= 0.5;
+
+    var left = 1 - Math.min(Math.max(sessionPct, 0), 100) / 100;
+    var sessResetMs = orgSessionResetMs(org);
+    // No session window at all: using the org starts a fresh one (ahead=1,
+    // left=1, neutral). A used session without a reset time: assume mid-window.
+    var ahead = sessResetMs === null
+      ? (sessionPct > 0 ? 0.5 : 1)
+      : Math.min(Math.max((sessResetMs - Date.now()) / 3600000, 0), SESSION_WINDOW_HOURS) / SESSION_WINDOW_HOURS;
+    var deficit = Math.max(0, ahead - left);
+    var surplus = Math.max(0, left - ahead);
+    score *= Math.max(SESSION_FLOOR, 1 - SESSION_PENALTY * deficit + SESSION_BONUS * surplus);
     return score;
   }
 
