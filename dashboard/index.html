@@ -1263,6 +1263,13 @@
   // time (40% left, minutes to go) is capacity about to expire unused, and
   // earns a use-it-or-lose-it bonus. A fresh session sits exactly at
   // neutral, so the weekly signal stays the primary ranking force.
+  // INVARIANT: the session factor is a bounded multiplier (SESSION_FLOOR
+  // to 1 + SESSION_BONUS, i.e. x0.05..x1.5) on the weekly-driven score.
+  // The weekly term spans orders of magnitude (hours^TIME_WEIGHT), so the
+  // session term can only reorder orgs whose weekly scores are already
+  // close; it must never resurrect a weekly-dead org (100% weekly = base
+  // 0 = still 0) nor outrank a clearly healthier weekly. Keep any future
+  // SESSION_* tuning inside bounds that preserve this.
   // Time is raised to a power > 1 so urgency outweighs raw remaining
   // capacity: a small plan resetting in hours should beat a big plan
   // resetting in days. Tuned by feel: 1.5 and 2 still ranked too much by capacity.
