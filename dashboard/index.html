@@ -274,6 +274,58 @@
     justify-content: center;
     font-family: var(--sans);
   }
+  /* Launch state: openProfile() toggles .is-launching instead of touching
+     the button's inner DOM (a textContent swap used to wipe the pill's
+     badge + labels and flash mangled plain text). */
+  @keyframes launch-sweep {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(100%); }
+  }
+  @keyframes launch-ring {
+    0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 40%, transparent); }
+    100% { box-shadow: 0 0 0 9px transparent; }
+  }
+  @keyframes launch-spin {
+    to { transform: rotate(360deg); }
+  }
+  .is-launching {
+    position: relative;
+    overflow: hidden;
+    pointer-events: none;
+  }
+  .is-launching::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(105deg, transparent 30%, color-mix(in srgb, var(--accent) 16%, transparent) 50%, transparent 70%);
+    animation: launch-sweep 0.9s ease-in-out infinite;
+  }
+  .upnext-pill.is-launching {
+    border-color: var(--accent);
+    animation: launch-ring 1.1s ease-out infinite;
+  }
+  .upnext-pill.is-launching .upnext-badge {
+    position: relative;
+    color: var(--accent);
+  }
+  .upnext-pill.is-launching .upnext-badge::after {
+    content: '';
+    position: absolute;
+    inset: -3px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    border-top-color: var(--accent);
+    animation: launch-spin 0.7s linear infinite;
+  }
+  button.open.is-launching {
+    animation: launch-ring 1.1s ease-out infinite;
+  }
+  button.open.is-launching::after {
+    background: linear-gradient(105deg, transparent 30%, rgba(255, 255, 255, 0.35) 50%, transparent 70%);
+  }
+  button.open.focus.is-launching::after {
+    background: linear-gradient(105deg, transparent 30%, color-mix(in srgb, var(--accent) 16%, transparent) 50%, transparent 70%);
+  }
   .upnext-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
   .upnext-who {
     font-size: 13px;
@@ -1629,21 +1681,27 @@
   }
 
   function openProfile(name, btn) {
+    if (btn.classList.contains('is-launching')) return;
     btn.disabled = true;
-    var original = btn.textContent;
-    btn.textContent = '...';
+    btn.classList.add('is-launching');
+    var started = Date.now();
+    // Hold the launch animation for at least one sweep cycle so a fast
+    // response doesn't flash it for a few frames.
+    var done = function () {
+      var wait = Math.max(0, 900 - (Date.now() - started));
+      setTimeout(function () {
+        btn.disabled = false;
+        btn.classList.remove('is-launching');
+      }, wait);
+    };
     fetch('/api/open', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Claude-Deck': '1' },
       body: JSON.stringify({ name: name })
     }).then(function () {
-      btn.disabled = false;
-      btn.textContent = original;
+      done();
       setTimeout(loadProfiles, 1200);
-    }).catch(function () {
-      btn.disabled = false;
-      btn.textContent = original;
-    });
+    }).catch(done);
   }
 
   function loadProfiles() {
