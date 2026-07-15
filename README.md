@@ -2,8 +2,6 @@
 
 **Run many Claude accounts side by side on one Mac or Windows PC.** A profile launcher and usage dashboard for the Claude Desktop app.
 
-![dashboard](docs/screenshot.png)
-
 ---
 
 > This is a small vibe-coded utility, and it takes meaningful access: it patches a system app (`Claude.app`) and reads your session cookies. Read the script before you run it.
