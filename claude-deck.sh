@@ -19,6 +19,7 @@
 #                                            # switched to a specific org first
 #   ./claude-deck.sh list              # list known profiles
 #   ./claude-deck.sh dash [port]       # run the local usage dashboard
+#   ./claude-deck.sh stop [port]       # (alias: kill) stop the dashboard + quit every open profile
 #   ./claude-deck.sh doctor            # repair session-index links, check patch freshness
 #   ./claude-deck.sh install           # copy to ~/.claude-deck/bin + zsh alias
 #   ./claude-deck.sh uninstall         # remove the alias only
@@ -225,28 +226,60 @@ asar_run() {
   ( cd "$TOOL_DIR" && "$NODE_BIN" node_modules/@electron/asar/bin/asar.js "$@" )
 }
 
+# Every main Claude.app process pid, one per line: `ps ax` output filtered
+# to the app's own executable path, mirroring the exact detection
+# _profile_is_running already relies on. Deliberately NOT pgrep: verified
+# live that pgrep -x AND -f both find nothing for Claude's main process,
+# even though `ps` lists its full command line fine and pgrep DOES see its
+# child Helper processes — the main process's argv is specifically hidden
+# from pgrep/pkill's matching syscall on this hardened-runtime build (a
+# real macOS protection, confirmed independent of any sandboxing), unlike
+# `ps` or a plain `kill <pid>` (a same-UID signal-send check, unrelated to
+# argv-read permission), which both still work.
+_running_claude_main_pids() {
+  ps ax -o pid,command 2>/dev/null | grep -F "Claude.app/Contents/MacOS/Claude" | grep -v grep | awk '{print $1}'
+}
+
 quit_claude() {
   # Never quit/kill the real, running Claude Desktop app as a side effect of
-  # patching a --app scratch target: osascript/pkill here are name-based
-  # ("Claude"), not path-based, so they'd hit the real app regardless of
-  # which bundle we're actually patching. Only act when the target IS the
-  # real install.
+  # patching a --app scratch target: osascript/pkill here match on a
+  # relative bundle-internal path ("Claude.app/Contents/MacOS/Claude"), not
+  # the scratch copy's full absolute path, so they'd hit the real app
+  # regardless of which bundle we're actually patching. Only act when the
+  # target IS the real install.
   if [ "$APP" != "/Applications/Claude.app" ]; then
     c_dim "Skipping quit_claude: target is $APP, not the real Claude.app."
     return 0
   fi
   # Don't issue `tell app to quit` if Claude isn't running: AppleScript
   # would launch it just to quit it (matters during watchdog runs).
-  if ! pgrep -x "Claude" >/dev/null 2>&1; then
-    return 0
-  fi
+  local pids
+  pids="$(_running_claude_main_pids)"
+  [ -n "$pids" ] || return 0
+
   step "Quitting Claude..."
   osascript -e 'tell application "Claude" to quit' 2>/dev/null || true
   for _ in 1 2 3 4 5; do
-    pgrep -x "Claude" >/dev/null || break
+    pids="$(_running_claude_main_pids)"
+    [ -n "$pids" ] || break
     sleep 1
   done
-  pkill -x "Claude" 2>/dev/null || true
+
+  # Still alive after a graceful quit: escalate by PID, SIGTERM then
+  # SIGKILL, each with a moment to actually take effect.
+  pids="$(_running_claude_main_pids)"
+  if [ -n "$pids" ]; then
+    printf '%s\n' "$pids" | while IFS= read -r pid; do
+      [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    done
+    sleep 2
+    pids="$(_running_claude_main_pids)"
+    if [ -n "$pids" ]; then
+      printf '%s\n' "$pids" | while IFS= read -r pid; do
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+      done
+    fi
+  fi
   sleep 1
 }
 
@@ -1554,6 +1587,36 @@ cmd_dash() {
 }
 
 # ---------------------------------------------------------------------------
+# stop
+# ---------------------------------------------------------------------------
+
+# Stops everything claude-deck can have running: the dashboard's Node server
+# (a plain background process with no tie to Claude.app at all — quitting
+# every Claude window does nothing to it, it just keeps listening until
+# something kills it, a reboot, or logout) and every open Claude Desktop
+# instance across every profile, including the default one.
+cmd_stop() {
+  local port="${1:-8965}"
+  local dash_pid
+  dash_pid="$(lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  if [ -n "$dash_pid" ]; then
+    step "Stopping dashboard server on port $port (pid $dash_pid)..."
+    kill "$dash_pid" 2>/dev/null || true
+  else
+    c_dim "No dashboard server found on port $port."
+  fi
+
+  # quit_claude() already does the right thing here: a plain AppleScript
+  # quit only ever reaches ONE of several processes that share the "Claude"
+  # bundle id, since each --profile launch is a genuinely separate process
+  # (open -n). Its pkill -x fallback is what actually reaches every one of
+  # them, across every profile at once.
+  quit_claude
+
+  c_green "✓ Stopped."
+}
+
+# ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
 
@@ -1837,6 +1900,11 @@ Usage:
                          untouched) and switches to that org first.
   $0 list                list known profiles (running? key captured?)
   $0 dash [port]         run the local usage dashboard (default port 8965)
+  $0 stop [port]         (alias: kill) stop the dashboard server and quit
+                         every running Claude Desktop instance, every
+                         profile including default. The dashboard server
+                         has no tie to Claude.app at all: quitting Claude
+                         windows never stops it on its own.
   $0 doctor              repair every profile's session-index link, check
                          patch freshness, run claude-sync if idle
   $0 install             add 'claude-deck' shortcut to ~/.zshrc
@@ -1869,6 +1937,7 @@ case "$SUBCOMMAND" in
   open)           cmd_open "$@" ;;
   list)           cmd_list ;;
   dash)           cmd_dash "$@" ;;
+  stop|kill)      cmd_stop "$@" ;;
   doctor)         cmd_doctor ;;
   install)        cmd_install ;;
   uninstall)      cmd_uninstall ;;

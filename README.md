@@ -55,9 +55,10 @@ Open `http://localhost:8965` to see the dashboard.
 | `claude-deck patch --verify-launch` | (dev/testing only, requires `--app <scratch-copy>`) Launch the patched app and confirm it stays alive 8s. |
 | `claude-deck revert` | Restore the original `Claude.app` from backup. |
 | `claude-deck status` | Show patch state, hashes, backup info, known profiles. |
-| `claude-deck open <name>` | Launch Claude with that profile, or focus its window if already running. |
+| `claude-deck open <name> [org-uuid]` | Launch Claude with that profile, or focus its window if already running. An org UUID (macOS only) switches to that org first, but only on a fresh launch — an already-running profile is always just focused, org untouched. |
 | `claude-deck list` | List known profiles and their cached usage. |
 | `claude-deck dash [port]` | Start the local dashboard (default port 8965). Repairs all profile index links first. |
+| `claude-deck stop [port]` (alias `kill`) | Stop the dashboard server and quit every running Claude instance, every profile including default. |
 | `claude-deck doctor` | Repair every profile's session-index link, check the installed patch is current, run claude-sync if Claude is closed. |
 | `claude-deck install` | Copy the script to `~/.claude-deck/` and add the `claude-deck` alias. |
 | `claude-deck uninstall` | Remove the alias only (does not revert the patch). |

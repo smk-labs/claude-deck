@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Do not run `claude-deck patch`, `claude-deck revert`, or anything that touches `/Applications/Claude.app` unless the user explicitly asks for it in this session, and only after confirming Claude Desktop is quit.** Smoke-testing the patch quits the running app: `patch` and `revert` both need Claude closed to rewrite `app.asar`, and the script will try to quit it via `osascript`. If Claude is open with unsaved context (an in-progress chat, a login flow), killing it is disruptive. Ask first, every time. `status` and `list` are read-only and always safe to run.
 
+## Never quit or kill a running Claude process yourself
+
+**Do not run `claude-deck stop`/`kill`, `quit_claude`, or any raw `kill`/`pkill` against a real Claude.app process — not even one instance, not even to verify a fix — under any circumstances, full stop.** This is a standing rule, not a per-session ask: if something needs verifying against a live, running Claude window, describe what to check and have the user run it themselves. This is stricter than the patch/revert rule above (which is "ask every time"): for quitting Claude, the answer is always no unless the user reopens the topic. The dashboard's own Node server (port 8965) and scratch `--app` test targets are NOT covered by this — those are fine to start/stop freely, they carry no account or session state.
+
 ## What this repo is
 
 A Bash script (`claude-deck.sh`, macOS) and its PowerShell twin (`claude-deck.ps1`, Windows), plus a small local dashboard (`dashboard/`). Each script patches the Claude Desktop app on its platform to accept a `--profile=NAME` launch argument, so each profile gets its own Electron `userData` directory, its own login session, and can run side by side with the others. The dashboard is a zero-dependency Node HTTP server that reads each profile's session key and shows its usage limits. There is no build system, no package manager, no tests: the two scripts and the two dashboard files *are* the product. An optional Cursor integration (`dashboard/cursor.js` plus `integrations/claude-code/`) sits alongside, off by default and untouched by the patch flow: see "Cursor integration" below.
@@ -21,12 +25,13 @@ A Bash script (`claude-deck.sh`, macOS) and its PowerShell twin (`claude-deck.ps
 ./claude-deck.sh open <name> [org-uuid]  # launch (or focus) a profile, optionally switched to one org first
 ./claude-deck.sh list                # list known profiles and their cached usage
 ./claude-deck.sh dash [port]         # start the local dashboard (default port 8965)
+./claude-deck.sh stop [port]         # (alias: kill) stop the dashboard + quit every open profile
 ./claude-deck.sh install             # copy to ~/.claude-deck/ + add zsh alias
 ./claude-deck.sh uninstall           # remove the alias only
 ./claude-deck.sh watchdog on|off     # install/remove the LaunchDaemon that re-patches on update (needs sudo)
 ```
 
-`patch` and `revert` need `sudo` (writes into `/Applications/Claude.app`) and need Claude quit first. `open`, `list`, `dash`, and `status` never touch the app bundle and never need sudo.
+`patch` and `revert` need `sudo` (writes into `/Applications/Claude.app`) and need Claude quit first. `open`, `list`, `dash`, and `status` never touch the app bundle and never need sudo. `stop` needs no sudo either and never touches the app bundle, but it does quit every running Claude instance — see the rule above.
 
 To smoke-test a change: confirm with the user, then edit the script, run `./claude-deck.sh revert` (if previously applied), then `./claude-deck.sh patch`, then `./claude-deck.sh open work` and verify the window title shows `[work]` and the profile gets its own login. `status` is the fastest sanity check between iterations.
 
@@ -47,6 +52,14 @@ Plain-language: one account can belong to several orgs (Team, Team-2, a personal
 - `cmd_open name [org-uuid]` (sh), `Cmd-Open name [org-uuid]` (ps1), and `POST /api/open {name, orgId}` all gate the seed behind the SAME not-running check the launch already uses, via real control flow (the `else` branch of the is-running check), not a separate up-front check: writing to a live Cookies WAL file from outside is externally silent (no crash, no lock error) but the running app can later overwrite or ignore it. **A profile that's already running is always just focused, org untouched, full stop** — switching orgs mid-session would yank the user out of whatever they're doing. Verified: a different-org request against a running profile leaves the Cookies mtime unchanged and returns the same `{ok:true, activated:true}` a plain open gives.
 - `server.js` passes `orgId` through as a 2nd CLI arg to whichever script it finds (`claude-deck.sh`/`.ps1`), so the shell/ps1 `open` does the seeding and it's never done twice; it only seeds the cookie itself in the no-script fallback (macOS `Cookies`, Windows `Network\Cookies`).
 - Dashboard: only the Up-next org pill passes `orgId` (it's the one row tied to one specific org); the profile card's own Open button still opens with no org, unchanged.
+
+## stop / kill, and the pgrep/pkill trap
+
+Plain-language: `stop` (alias `kill`) is a force-quit-everything command — it stops the dashboard's Node server and quits every open Claude profile, default included. It exists precisely for when quitting windows one by one isn't good enough; see the rule near the top of this file about never running it yourself.
+
+- `cmd_stop [port]`: kills whatever's listening on the dashboard port (`lsof -ti tcp:<port> -sTCP:LISTEN`, default 8965) if anything is, then calls `quit_claude` (see below) to close every running Claude instance across every profile.
+- **`pgrep -x "Claude"` / `pkill -x "Claude"` cannot see Claude's main process at all on this hardened-runtime build — confirmed live, and this was a real, silent bug in `quit_claude()` from the start**, not something introduced by `stop`. Two independent, stacked causes: (1) the process's kernel `comm` name is the FULL executable path (`/Applications/Claude.app/Contents/MacOS/Claude`), not the bare `Claude` basename `-x` expects (`ps -o comm` shows this truncated to `/Applications/Cl`); (2) even switching to `-f` (full command line) still finds nothing for the MAIN process specifically — `pgrep -f "Claude"` matches every one of its child Helper/renderer/crashpad processes just fine, but never the top-level one, even though `ps` lists its full command line with no trouble. This is a macOS argv-visibility protection on the main binary, confirmed independent of any sandboxing (reproduced identically with the agent's own sandbox fully disabled). Because of (2), `pgrep -x "Claude"` failing silently meant `quit_claude()` returned before even attempting the AppleScript quit — every previous `patch`/`revert` run had been relying entirely on the user having already quit Claude manually first, exactly as the top-of-file rule already asks for.
+- Fix: `_running_claude_main_pids()` uses the same `ps ax -o pid,command | grep -F "Claude.app/Contents/MacOS/Claude"` scan `_profile_is_running` already relies on for detection, and `quit_claude()` signals by PID directly with a plain `kill`/`kill -9` rather than `pkill`. A bare `kill(pid, sig)` only needs same-UID signal-send permission — a completely different, unrelated check from the argv-read permission `pgrep`/`pkill`'s matching syscall lacks for this process. Escalation ladder: AppleScript `tell application "Claude" to quit` first (up to 5s to take effect), then SIGTERM by PID, then SIGKILL by PID if still alive 2s later.
 
 ## Architecture / how the patch works
 
