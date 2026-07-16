@@ -1331,8 +1331,8 @@ $RcEnd
   Ok '[OK] Installed.'
   Note "Script is safe at: $CanonicalPath (original checkout can be removed)"
   Note "Open a new PowerShell (or: . `$PROFILE), then use:"
-  Note '  claude-deck patch       # apply'
-  Note '  claude-deck open work   # launch a profile'
+  Note '  claude-deck open work   # launch a profile (no patch needed on MSIX)'
+  Note '  claude-deck list        # list profiles'
   Note '  claude-deck dash        # usage dashboard'
 }
 
