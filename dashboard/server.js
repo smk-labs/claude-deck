@@ -8,6 +8,7 @@ const path = require('path');
 const os = require('os');
 const { execFile, spawn } = require('child_process');
 const cursor = require('./cursor.js');
+const cookieCrypto = require('./cookie-crypto.js');
 
 const IS_WIN = process.platform === 'win32';
 // Port precedence: explicit CLAUDE_DECK_PORT, then a positional arg, then the
@@ -819,6 +820,10 @@ function handleCursorOpen(req, res) {
   });
 }
 
+function profileUserDataDir(name) {
+  return path.join(os.homedir(), 'Library', 'Application Support', 'Claude Profiles', name);
+}
+
 function handleOpen(req, res) {
   let body = '';
   let tooLarge = false;
@@ -845,9 +850,18 @@ function handleOpen(req, res) {
       return sendJson(res, 400, { ok: false, error: 'invalid profile name' });
     }
 
+    const orgId = parsed.orgId;
+    if (orgId !== undefined && !cookieCrypto.UUID_RE.test(orgId)) {
+      return sendJson(res, 400, { ok: false, error: 'invalid org id' });
+    }
+
     const running = await getRunningProfiles();
     if (running.has(name)) {
-      // Already running: never spawn a duplicate on the same userData dir.
+      // Already running: never spawn a duplicate on the same userData dir,
+      // and never touch its active org either. Switching orgs mid-session
+      // would yank the user out of whatever they're doing in that window;
+      // an org-targeted click on an already-open profile must do exactly
+      // what a plain open does — just focus it.
       if (IS_WIN) {
         // No reliable cross-window activate on Windows without extra deps.
         return sendJson(res, 200, { ok: true, activated: true });
@@ -865,10 +879,15 @@ function handleOpen(req, res) {
     // Falls back to a direct launch if no installed script is found.
     const script = findClaudeDeckScript();
     if (script) {
+      // orgId is only meaningful on macOS's cmd_open (claude-deck.ps1 doesn't
+      // take a 2nd arg yet); cmd_open itself does the cookie-seeding, so it
+      // is never also done here.
       const cmd = IS_WIN ? 'powershell.exe' : '/bin/bash';
       const cmdArgs = IS_WIN
         ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, 'open', name]
-        : [script, 'open', name];
+        : orgId
+          ? [script, 'open', name, orgId]
+          : [script, 'open', name];
       return execFile(cmd, cmdArgs, { windowsHide: true }, (err) => {
         if (err) return sendJson(res, 500, { ok: false, error: 'failed to launch Claude' });
         sendJson(res, 200, { ok: true });
@@ -920,6 +939,17 @@ function handleOpen(req, res) {
     // patched and an unpatched app; `open` forwards the environment, and
     // the --profile flag stays for getRunningProfiles and, while patched,
     // the injected title/exporter label).
+    //
+    // Unlike the script path above, there's no cmd_open to delegate the
+    // cookie-seed to, so it happens right here, best-effort: a failure must
+    // never block the launch itself.
+    if (orgId && name !== 'default') {
+      try {
+        cookieCrypto.seedOrg(path.join(profileUserDataDir(name), 'Cookies'), orgId);
+      } catch (e) {
+        // ignored: falls through to a normal launch
+      }
+    }
     const args =
       name === 'default'
         ? ['-n', '-a', 'Claude']
@@ -930,13 +960,7 @@ function handleOpen(req, res) {
         : {
             env: {
               ...process.env,
-              CLAUDE_USER_DATA_DIR: path.join(
-                os.homedir(),
-                'Library',
-                'Application Support',
-                'Claude Profiles',
-                name
-              ),
+              CLAUDE_USER_DATA_DIR: profileUserDataDir(name),
             },
           };
     execFile('open', args, opts, (err) => {

@@ -15,7 +15,8 @@
 #   ./claude-deck.sh patch [--force] [--verify-launch]  # apply (idempotent)
 #   ./claude-deck.sh revert            # restore original Claude.app
 #   ./claude-deck.sh status            # show patch state, hashes, backup info
-#   ./claude-deck.sh open [name]       # launch/focus a profile (no name = default)
+#   ./claude-deck.sh open [name] [org-uuid]  # launch/focus a profile, optionally
+#                                            # switched to a specific org first
 #   ./claude-deck.sh list              # list known profiles
 #   ./claude-deck.sh dash [port]       # run the local usage dashboard
 #   ./claude-deck.sh doctor            # repair session-index links, check patch freshness
@@ -1237,6 +1238,54 @@ _validate_profile_name() {
   esac
 }
 
+_validate_org_uuid() {
+  local uuid="$1"
+  if ! [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    die "Org id must be a UUID: $uuid"
+  fi
+}
+
+# Splices org_uuid into <name>'s own lastActiveOrg cookie via
+# dashboard/cookie-crypto.js, so launching lands on that org instead of
+# whatever was last active. Pure filesystem/keychain work on the profile's
+# own Cookies sqlite file: no asar, no app bundle, no patch. Never fatal —
+# a failure here (missing sqlite3, no cached cookie yet, keychain denied)
+# falls through to a normal launch rather than blocking `open`.
+#
+# The caller (cmd_open) must only reach this from the "not running" branch:
+# writing to a live Cookies WAL file is externally silent (no crash, no lock
+# error) but the running app can later overwrite or ignore it, so the
+# not-running check has to gate this call through real control flow.
+_seed_active_org() {
+  local name="$1" org_uuid="$2"
+  local cookies_db="$PROFILES_USERDATA_ROOT/$name/Cookies"
+
+  if [ ! -f "$cookies_db" ]; then
+    c_dim "Profile '$name' has no Cookies file yet (never logged in): skipping org switch."
+    return 0
+  fi
+
+  local helper="$SOURCE_DIR/dashboard/cookie-crypto.js"
+  if [ ! -f "$helper" ]; then
+    c_yellow "cookie-crypto.js not found next to this script: skipping org switch."
+    return 0
+  fi
+
+  ensure_node
+
+  step "Switching '$name' to org $org_uuid before launch..."
+  if "$NODE_BIN" "$helper" seed-org "$cookies_db" "$org_uuid" 2>/dev/null; then
+    c_dim "  org cookie updated."
+  else
+    local rc=$?
+    if [ "$rc" = "2" ]; then
+      c_dim "  '$name' has no active-org cookie yet (never opened claude.ai in it): launching normally."
+    else
+      c_yellow "  could not switch org (continuing with a normal launch)."
+    fi
+  fi
+}
+
 _profile_is_running() {
   # True if a Claude process is running for <name>. The real default instance
   # never carries --profile= at all (mirrors server.js getRunningProfiles),
@@ -1320,6 +1369,7 @@ ensure_profile_index_link() {
 
 cmd_open() {
   local name="${1:-}"
+  local org_uuid="${2:-}"
 
   if [ -z "$name" ] || [ "$name" = "default" ]; then
     if _profile_is_running "default"; then
@@ -1362,6 +1412,10 @@ tell application "System Events"
 end tell
 OSA
   else
+    if [ -n "$org_uuid" ]; then
+      _validate_org_uuid "$org_uuid"
+      _seed_active_org "$name" "$org_uuid"
+    fi
     step "Launching new Claude instance for profile '$name'..."
     # Launch through Claude's own built-in CLAUDE_USER_DATA_DIR hook (top
     # level of index.pre.js, unconditional, no platform guard: verified on
@@ -1776,7 +1830,11 @@ Usage:
                          with --app <scratch-copy>, never the real install)
   $0 revert              restore the original Claude.app
   $0 status              show patch state, hashes, backup info, profiles
-  $0 open [name]         launch/focus a profile (no name = default profile)
+  $0 open [name] [org-uuid]
+                         launch/focus a profile (no name = default profile).
+                         An org-uuid only applies on a fresh launch (a
+                         profile already running is just focused, org
+                         untouched) and switches to that org first.
   $0 list                list known profiles (running? key captured?)
   $0 dash [port]         run the local usage dashboard (default port 8965)
   $0 doctor              repair every profile's session-index link, check

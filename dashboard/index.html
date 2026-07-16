@@ -1583,7 +1583,7 @@
       meta.appendChild(el('span', c.sessionPct > 80 ? 'pct-hot' : '', c.sessionPct + '% session'));
       text.appendChild(meta);
       pill.appendChild(text);
-      pill.addEventListener('click', function () { openProfile(c.profile.name, pill); });
+      pill.addEventListener('click', function () { openProfile(c.profile.name, pill, c.org.id); });
       row.appendChild(pill);
     });
 
@@ -1687,7 +1687,7 @@
     renderUpNext();
   }
 
-  function openProfile(name, btn) {
+  function openProfile(name, btn, orgId) {
     if (btn.classList.contains('is-launching')) return;
     btn.disabled = true;
     btn.classList.add('is-launching');
@@ -1701,10 +1701,14 @@
         btn.classList.remove('is-launching');
       }, wait);
     };
+    var body = { name: name };
+    // Only meaningful on a fresh launch: the server focuses an already-
+    // running profile as-is and never touches its active org.
+    if (orgId) body.orgId = orgId;
     fetch('/api/open', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Claude-Deck': '1' },
-      body: JSON.stringify({ name: name })
+      body: JSON.stringify(body)
     }).then(function () {
       done();
       setTimeout(loadProfiles, 1200);
