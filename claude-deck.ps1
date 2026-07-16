@@ -89,12 +89,16 @@ function Die($m)  { Write-Host "[x] $m" -ForegroundColor Red; exit 1 }
 # app resolution
 # ---------------------------------------------------------------------------
 
-# Claude Desktop on Windows installs via Squirrel: each version is a fresh
-# %LOCALAPPDATA%\AnthropicClaude\app-<version>\ directory holding claude.exe
-# and resources\app.asar. We always target the newest one. An auto-update
-# creates a brand-new directory, which naturally removes the patch: re-run
-# `patch` after updates (state, logins, and profiles all survive: they live
-# outside the app directory).
+# Claude Desktop on Windows now ships as an MSIX package (under
+# C:\Program Files\WindowsApps\Claude_<ver>_x64__<hash>\app\). MSIX cannot
+# and must not be patched, and it does not need to be: the app has a
+# built-in CLAUDE_USER_DATA_DIR env hook (an unconditional block in
+# .vite/build/index.pre.js calls app.setPath('userData', dir) right before
+# the single-instance lock), so `open` launches profiles purely via that
+# env var. Verified live: a second instance runs side by side with its own
+# login. Older machines may still carry the legacy Squirrel install
+# (%LOCALAPPDATA%\AnthropicClaude\app-<version>\); we resolve MSIX first
+# and fall back to Squirrel, and only Squirrel targets are patchable.
 #
 # Resolution is lazy (not at script start) so commands that don't touch the
 # app bundle (install, uninstall, help, dash, list) still work on a machine
@@ -104,6 +108,7 @@ $script:Res = $null
 $script:Asar = $null
 $script:Unpacked = $null
 $script:Exe = $null
+$script:IsMsix = $false
 $IsRealInstall = (-not $script:AppOverride)
 
 function Find-AppDir {
@@ -112,6 +117,19 @@ function Find-AppDir {
     if (-not (Test-Path (Join-Path (Join-Path $dir 'resources') 'app.asar'))) { return $null }
     return (Resolve-Path $dir).Path
   }
+  # MSIX first: the packaged app dir is <InstallLocation>\app, holding
+  # Claude.exe and resources\app.asar in the same relative layout as a
+  # Squirrel app-<version> dir, so everything downstream just works.
+  try {
+    $pkg = Get-AppxPackage -Name Claude -ErrorAction SilentlyContinue
+    if ($pkg -and $pkg.InstallLocation) {
+      $appDir = Join-Path $pkg.InstallLocation 'app'
+      if (Test-Path (Join-Path $appDir 'Claude.exe')) {
+        $script:IsMsix = $true
+        return $appDir
+      }
+    }
+  } catch {}
   if (-not (Test-Path $ClaudeRoot)) { return $null }
   $dirs = @(Get-ChildItem -Path $ClaudeRoot -Directory -Filter 'app-*' -ErrorAction SilentlyContinue |
     Where-Object { Test-Path (Join-Path (Join-Path $_.FullName 'resources') 'app.asar') })
@@ -139,7 +157,7 @@ function Require-AppPaths {
     if ($script:AppOverride) {
       Die "--app target '$($script:AppOverride)' has no resources\app.asar."
     }
-    Die "Claude Desktop not found at $ClaudeRoot (no app-* directory with resources\app.asar). Install it from claude.ai/download first."
+    Die "Claude Desktop not found (no MSIX package named Claude, and no Squirrel app-* directory at $ClaudeRoot). Install it from claude.ai/download first."
   }
 }
 
@@ -152,6 +170,12 @@ $BackupUnpacked = Join-Path $BackupDir 'app.asar.unpacked.orig'
 $BackupVersion  = Join-Path $BackupDir 'claude-version.txt'
 
 function Get-ClaudeVersion {
+  if ($script:IsMsix) {
+    # MSIX: the version lives in the package name, one level above app\.
+    $pkgDir = Split-Path (Split-Path $AppDir -Parent) -Leaf
+    if ($pkgDir -match '^Claude_([0-9.]+)_') { return $Matches[1] }
+    return '?'
+  }
   $name = Split-Path $AppDir -Leaf
   if ($name -match '^app-(.+)$') { return $Matches[1] }
   return '?'
@@ -279,7 +303,10 @@ const SENTINEL = 'dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX';
 const idx = buf.indexOf(SENTINEL);
 if (idx < 0) { console.log('no-sentinel'); process.exit(0); }
 const base = idx + SENTINEL.length;
-const version = String.fromCharCode(buf[base]);
+// Version and length are RAW bytes (0x01, not ASCII '1'); only the fuse
+// state bytes are ASCII. Reading the version as a char produced an
+// invisible control character and a baffling "unknown version ('')".
+const version = buf[base];
 const length = buf[base + 1];
 let state = '?';
 if (length >= 5) state = String.fromCharCode(buf[base + 2 + 4]);
@@ -338,11 +365,19 @@ function Has-OtherPatch {
 # Main Claude processes only: on Windows every Electron child (renderer, GPU,
 # utility) is also claude.exe, but children always carry --type=<something>
 # and never --profile=. Filtering out --type= leaves exactly the main
-# process per running instance.
+# process per running instance. The executable-path filter matters too: the
+# Claude Code CLI also runs as claude.exe (no --type=, no --profile=) and
+# would otherwise read as "default profile running" forever.
 function Get-ClaudeMainProcesses {
   try {
     return @(Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue |
-      Where-Object { $_.CommandLine -and $_.CommandLine -notmatch '--type=' })
+      Where-Object {
+        $_.CommandLine -and $_.CommandLine -notmatch '--type=' -and
+        $_.ExecutablePath -and (
+          $_.ExecutablePath -like '*\WindowsApps\Claude_*' -or
+          $_.ExecutablePath -like '*\AnthropicClaude\*'
+        )
+      })
   } catch { return @() }
 }
 
@@ -381,9 +416,18 @@ function Quit-Claude {
 
 function Cmd-Status {
   Require-AppPaths
-  Ensure-AsarTool
   Note "Claude version:  $(Get-ClaudeVersion)"
   Note "App directory:   $AppDir"
+  if ($script:IsMsix) {
+    Ok '[*] MSIX install: no patch needed. Profiles launch via the app''s built-in CLAUDE_USER_DATA_DIR hook.'
+    $n = 0
+    if (Test-Path $ProfilesDir) {
+      $n = @(Get-ChildItem -Path $ProfilesDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+    }
+    Note "Known profiles (captured session keys): $n"
+    return
+  }
+  Ensure-AsarTool
   if (Is-Patched) {
     Ok '[*] PATCHED (--profile support active)'
   } else {
@@ -509,6 +553,9 @@ function Cmd-Patch {
   }
 
   Require-AppPaths
+  if ($script:IsMsix) {
+    Die 'Claude is installed as an MSIX package now: it cannot and must not be patched, and it does not need to be. Profiles work without any patch: just run  claude-deck open <name>  (the app''s built-in CLAUDE_USER_DATA_DIR hook does the isolation). Nothing was modified.'
+  }
   Ensure-AsarTool
 
   if ((Is-Patched) -and (-not $script:Force)) {
@@ -676,7 +723,7 @@ function Write-Injector($out) {
 // and reports each profile's session key locally for the usage dashboard.
 // Everything here is wrapped defensively: this module must never be able
 // to crash the app, even if Claude's internals change under us.
-const { app, session } = require('electron');
+const { app, session, BrowserWindow } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -867,11 +914,74 @@ function pullSessionKey(ses) {
   });
 }
 
+// 3b) Session seeding (login import): the reverse of the reporter above,
+//     so a profile JSON copied from another machine signs in on first
+//     launch. A raw userData copy cannot carry a login across machines:
+//     Electron encrypts cookies at rest with an OS-bound key (macOS
+//     Keychain / Windows DPAPI), so a copied cookie store is
+//     undecryptable there. The plain sessionKey in the JSON can simply
+//     be planted as a fresh cookie instead. Seeds ONLY when the session
+//     has no sessionKey cookie at all: a live login always wins and is
+//     never overwritten. Always resolves (true only when a seed landed),
+//     never rejects, so callers can chain on it safely.
+function seedSessionKey(ses) {
+  return new Promise(function (resolve) {
+    var settled = false;
+    function finish(seeded) {
+      if (!settled) { settled = true; resolve(seeded); }
+    }
+    try {
+      var saved = readExistingProfile(path.join(PROFILES_DIR, LABEL + '.json'));
+      var key = (saved && typeof saved.sessionKey === 'string') ? saved.sessionKey : '';
+      if (!key) { finish(false); return; }
+      ses.cookies.get({ url: 'https://claude.ai', name: 'sessionKey' })
+        .then(function (cookies) {
+          if (cookies && cookies.length > 0) { finish(false); return; }
+          return ses.cookies.set({
+            url: 'https://claude.ai',
+            name: 'sessionKey',
+            value: key,
+            secure: true,
+            httpOnly: true,
+            sameSite: 'lax',
+            expirationDate: Math.floor(Date.now() / 1000) + 60 * 24 * 60 * 60
+          }).then(function () { finish(true); });
+        })
+        .catch(function () { finish(false); });
+    } catch (e) {
+      finish(false);
+    }
+  });
+}
+
+// If the first window loaded claude.ai before the seed landed, it rendered
+// the logged-out page: reload every window already created at that point,
+// once, so the seeded login takes effect. Windows created after the seed
+// see the cookie anyway.
+function reloadOpenWindows() {
+  safeRun(function () {
+    var wins = BrowserWindow.getAllWindows();
+    for (var i = 0; i < wins.length; i++) {
+      safeRun(function () {
+        var win = wins[i];
+        if (win && !win.isDestroyed() && win.webContents) win.webContents.reload();
+      });
+    }
+  });
+}
+
 safeRun(function () {
   app.whenReady().then(function () {
     safeRun(function () {
       var ses = (PROFILE ? session.defaultSession : session.defaultSession);
-      pullSessionKey(ses);
+      // Seed before the first pull: pulling first could re-write the
+      // profile JSON from a cookie read taken before the seed landed.
+      seedSessionKey(ses).then(function (seeded) {
+        safeRun(function () {
+          if (seeded) reloadOpenWindows();
+          pullSessionKey(ses);
+        });
+      }).catch(function () {});
       // Re-pull periodically in case the cookie change event is missed
       // (e.g. token silently refreshed without a 'changed' event).
       setInterval(function () { pullSessionKey(ses); }, 30 * 60 * 1000);
@@ -901,6 +1011,9 @@ safeRun(function () {
 
 function Cmd-Revert {
   Require-AppPaths
+  if ($script:IsMsix) {
+    Die 'Claude is an MSIX package now: it was never patched, so there is nothing to revert. Profiles need no patch (they use the built-in CLAUDE_USER_DATA_DIR hook). Nothing was modified.'
+  }
   if (-not (Test-Path $BackupAsar)) { Die "No backup found at ${BackupAsar}: nothing to revert." }
 
   Quit-Claude
@@ -991,6 +1104,35 @@ function Ensure-ProfileIndexLink($name) {
   return $true
 }
 
+# Launch one Claude instance, profile-aware. Profiles ride the app's own
+# CLAUDE_USER_DATA_DIR hook (no patch involved): set the env var, spawn,
+# clear it. --profile=<name> is passed as an inert marker so
+# Profile-Running can identify the instance from its command line.
+# Chromium/Electron child markers (CHROME_*, ELECTRON_*) are scrubbed
+# first: a terminal hosted inside Claude Desktop leaks
+# CHROME_CRASHPAD_PIPE_NAME, which makes the spawned app misbehave as if
+# it were a crashed child process.
+function Start-ClaudeInstance($name) {
+  foreach ($e in @(Get-ChildItem Env:)) {
+    if ($e.Name -match '^(CHROME_|ELECTRON_)') {
+      Remove-Item "Env:$($e.Name)" -ErrorAction SilentlyContinue
+    }
+  }
+  if ($name -and $name -ne 'default') {
+    $dir = Join-Path $ProfilesUserDataRoot $name
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $env:CLAUDE_USER_DATA_DIR = $dir
+    try {
+      Start-Process -FilePath $Exe -ArgumentList "--profile=$name" -WorkingDirectory $AppDir
+    } finally {
+      Remove-Item Env:CLAUDE_USER_DATA_DIR -ErrorAction SilentlyContinue
+    }
+  } else {
+    Remove-Item Env:CLAUDE_USER_DATA_DIR -ErrorAction SilentlyContinue
+    Start-Process -FilePath $Exe -WorkingDirectory $AppDir
+  }
+}
+
 function Cmd-Open($name) {
   Require-AppPaths
   if (-not $name -or $name -eq 'default') {
@@ -1001,7 +1143,7 @@ function Cmd-Open($name) {
       try { (New-Object -ComObject WScript.Shell).AppActivate('Claude') | Out-Null } catch {}
     } else {
       Step 'Opening Claude (default profile)...'
-      Start-Process -FilePath $Exe
+      Start-ClaudeInstance 'default'
     }
     return
   }
@@ -1011,12 +1153,16 @@ function Cmd-Open($name) {
 
   if (Profile-Running $name) {
     Step "Profile '$name' already running: focusing its window..."
-    # Window titles are tagged [name] by the injection; AppActivate matches
-    # on title prefix/exact, so this is best-effort only.
-    try { (New-Object -ComObject WScript.Shell).AppActivate("[$name]") | Out-Null } catch {}
+    # Best-effort: MSIX instances have no [name] title prefix (that came
+    # from the retired asar injection), so try the tagged title first for
+    # legacy patched installs, then fall back to the plain app title.
+    $sh = New-Object -ComObject WScript.Shell
+    $ok = $false
+    try { $ok = $sh.AppActivate("[$name]") } catch {}
+    if (-not $ok) { try { $sh.AppActivate('Claude') | Out-Null } catch {} }
   } else {
     Step "Launching new Claude instance for profile '$name'..."
-    Start-Process -FilePath $Exe -ArgumentList "--profile=$name"
+    Start-ClaudeInstance $name
   }
 }
 
@@ -1098,15 +1244,18 @@ function Cmd-Doctor {
   Step 'Repairing session-index links for every named profile...'
   Repair-AllProfiles
 
-  Step 'Checking installed patch freshness...'
-  Doctor-CheckInjectionFreshness
-
   try {
-    if ((Resolve-AppPaths) -and (Test-Path $Asar)) {
-      Ensure-AsarTool
-      if (-not (Is-Patched)) {
-        Warn 'The installed app is not patched (a Claude auto-update replaces the app folder).'
-        Warn 'Run: claude-deck patch'
+    if (Resolve-AppPaths) {
+      if ($script:IsMsix) {
+        Note 'MSIX install detected: no patch needed (profiles use CLAUDE_USER_DATA_DIR).'
+      } elseif (Test-Path $Asar) {
+        Step 'Checking installed patch freshness...'
+        Doctor-CheckInjectionFreshness
+        Ensure-AsarTool
+        if (-not (Is-Patched)) {
+          Warn 'The installed app is not patched (a Claude auto-update replaces the app folder).'
+          Warn 'Run: claude-deck patch'
+        }
       }
     }
   } catch {

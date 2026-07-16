@@ -187,21 +187,29 @@ function getRunningProfiles() {
       // Every Electron child process is also claude.exe on Windows, but
       // children always carry --type=<something> and never --profile=, so
       // filtering out --type= leaves one main process per running instance.
+      // The executable path filter matters too: the Claude Code CLI is also
+      // a claude.exe with no --type= and no --profile=, and would otherwise
+      // be counted as the default profile forever. Only the desktop app
+      // (MSIX under WindowsApps\Claude_, or legacy Squirrel AnthropicClaude)
+      // counts. Emit ExecutablePath and CommandLine together, tab-delimited.
       execFile(
         'powershell.exe',
         [
           '-NoProfile',
           '-Command',
-          "Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | ForEach-Object { $_.CommandLine }",
+          "Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | ForEach-Object { $_.ExecutablePath + [char]9 + $_.CommandLine }",
         ],
         { maxBuffer: 4 * 1024 * 1024, windowsHide: true },
         (err, stdout) => {
           if (err || !stdout) return resolve(new Set());
           const running = new Set();
           for (const line of stdout.split(/\r?\n/)) {
-            if (!/claude\.exe/i.test(line)) continue;
-            if (line.includes('--type=')) continue;
-            const match = line.match(/--profile=([A-Za-z0-9_-]{1,32})/);
+            const tab = line.indexOf('\t');
+            const exePath = tab >= 0 ? line.slice(0, tab) : '';
+            const cmd = tab >= 0 ? line.slice(tab + 1) : line;
+            if (!/\\WindowsApps\\Claude_/i.test(exePath) && !/\\AnthropicClaude\\/i.test(exePath)) continue;
+            if (cmd.includes('--type=')) continue;
+            const match = cmd.match(/--profile=([A-Za-z0-9_-]{1,32})/);
             running.add(match ? match[1] : 'default');
           }
           resolve(running);
@@ -227,9 +235,25 @@ function getRunningProfiles() {
   });
 }
 
-// Newest Windows Claude install dir (%LOCALAPPDATA%\AnthropicClaude\app-*),
-// used only as the direct-launch fallback when no claude-deck.ps1 is found.
+// Windows Claude executable, used only as the direct-launch fallback when no
+// claude-deck.ps1 is found. Prefers the current MSIX package (its Claude.exe
+// under Program Files\WindowsApps), falls back to the legacy Squirrel install
+// (%LOCALAPPDATA%\AnthropicClaude\app-*).
 function findClaudeExeWin() {
+  try {
+    const out = require('child_process').execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-Command', '(Get-AppxPackage -Name Claude).InstallLocation'],
+      { windowsHide: true, encoding: 'utf8' }
+    );
+    const loc = (out || '').trim();
+    if (loc) {
+      const exe = path.join(loc, 'app', 'Claude.exe');
+      if (fs.existsSync(exe)) return exe;
+    }
+  } catch (e) {
+    // no MSIX package; fall through to Squirrel
+  }
   try {
     const root = path.join(process.env.LOCALAPPDATA || '', 'AnthropicClaude');
     const dirs = fs
@@ -852,14 +876,34 @@ function handleOpen(req, res) {
     }
 
     if (IS_WIN) {
-      // Fallback (no script): launch the newest installed claude.exe
-      // directly, detached (waiting for the app to exit would hang this
-      // response forever).
+      // Fallback (no script): launch the installed claude.exe directly,
+      // detached (waiting for the app to exit would hang this response
+      // forever). Profiles ride the app's built-in CLAUDE_USER_DATA_DIR
+      // hook, so set that env var (mirroring the ps1 Start-ClaudeInstance),
+      // and scrub CHROME_*/ELECTRON_* leaked by an Electron-hosted parent so
+      // the spawned app doesn't misbehave as a crashed child process.
       const exe = findClaudeExeWin();
       if (!exe) return sendJson(res, 500, { ok: false, error: 'Claude install not found' });
       const exeArgs = name === 'default' ? [] : ['--profile=' + name];
+      const childEnv = {};
+      for (const k of Object.keys(process.env)) {
+        if (/^(CHROME_|ELECTRON_)/.test(k)) continue;
+        childEnv[k] = process.env[k];
+      }
+      if (name !== 'default') {
+        const dir = path.join(process.env.APPDATA || '', 'Claude Profiles', name);
+        try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
+        childEnv.CLAUDE_USER_DATA_DIR = dir;
+      } else {
+        delete childEnv.CLAUDE_USER_DATA_DIR;
+      }
       try {
-        const child = spawn(exe, exeArgs, { detached: true, stdio: 'ignore' });
+        const child = spawn(exe, exeArgs, {
+          detached: true,
+          stdio: 'ignore',
+          cwd: path.dirname(exe),
+          env: childEnv,
+        });
         child.unref();
         return sendJson(res, 200, { ok: true });
       } catch (e) {
