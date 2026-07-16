@@ -928,7 +928,9 @@
 
   // Urgency tier from time remaining: 'critical' under 4h, 'warning' under
   // 12h, 'default' otherwise. Drives the "use it or lose it" pill styling.
+  // No reset time means nothing is expiring, so there is no urgency.
   function urgencyTier(resetsAtMs) {
+    if (resetsAtMs === null || resetsAtMs === undefined) return 'default';
     var diff = resetsAtMs - Date.now();
     if (diff < URGENCY_CRITICAL_MS) return 'critical';
     if (diff < URGENCY_WARNING_MS) return 'warning';
@@ -1467,6 +1469,9 @@
           if (earliest === null || t < earliest.t) earliest = { t: t, iso: w.resetsAt };
         });
         var maxWeeklyPct = orgMaxWeeklyUtilization(org);
+        // A fully exhausted weekly limit means there is nothing left to
+        // use until it resets, so the org has no business in "Up next".
+        if (maxWeeklyPct >= 100) return;
         var resetsAtMs = earliest ? earliest.t : null;
         candidates.push({
           profile: profile,
