@@ -884,7 +884,7 @@ _write_injector() {
 // and reports each profile's session key locally for the usage dashboard.
 // Everything here is wrapped defensively: this module must never be able
 // to crash the app, even if Claude's internals change under us.
-const { app, session } = require('electron');
+const { app, session, BrowserWindow } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -1075,11 +1075,74 @@ function pullSessionKey(ses) {
   });
 }
 
+// 3b) Session seeding (login import): the reverse of the reporter above,
+//     so a profile JSON copied from another machine signs in on first
+//     launch. A raw userData copy cannot carry a login across machines:
+//     Electron encrypts cookies at rest with an OS-bound key (macOS
+//     Keychain / Windows DPAPI), so a copied cookie store is
+//     undecryptable there. The plain sessionKey in the JSON can simply
+//     be planted as a fresh cookie instead. Seeds ONLY when the session
+//     has no sessionKey cookie at all: a live login always wins and is
+//     never overwritten. Always resolves (true only when a seed landed),
+//     never rejects, so callers can chain on it safely.
+function seedSessionKey(ses) {
+  return new Promise(function (resolve) {
+    var settled = false;
+    function finish(seeded) {
+      if (!settled) { settled = true; resolve(seeded); }
+    }
+    try {
+      var saved = readExistingProfile(path.join(PROFILES_DIR, LABEL + '.json'));
+      var key = (saved && typeof saved.sessionKey === 'string') ? saved.sessionKey : '';
+      if (!key) { finish(false); return; }
+      ses.cookies.get({ url: 'https://claude.ai', name: 'sessionKey' })
+        .then(function (cookies) {
+          if (cookies && cookies.length > 0) { finish(false); return; }
+          return ses.cookies.set({
+            url: 'https://claude.ai',
+            name: 'sessionKey',
+            value: key,
+            secure: true,
+            httpOnly: true,
+            sameSite: 'lax',
+            expirationDate: Math.floor(Date.now() / 1000) + 60 * 24 * 60 * 60
+          }).then(function () { finish(true); });
+        })
+        .catch(function () { finish(false); });
+    } catch (e) {
+      finish(false);
+    }
+  });
+}
+
+// If the first window loaded claude.ai before the seed landed, it rendered
+// the logged-out page: reload every window already created at that point,
+// once, so the seeded login takes effect. Windows created after the seed
+// see the cookie anyway.
+function reloadOpenWindows() {
+  safeRun(function () {
+    var wins = BrowserWindow.getAllWindows();
+    for (var i = 0; i < wins.length; i++) {
+      safeRun(function () {
+        var win = wins[i];
+        if (win && !win.isDestroyed() && win.webContents) win.webContents.reload();
+      });
+    }
+  });
+}
+
 safeRun(function () {
   app.whenReady().then(function () {
     safeRun(function () {
       var ses = (PROFILE ? session.defaultSession : session.defaultSession);
-      pullSessionKey(ses);
+      // Seed before the first pull: pulling first could re-write the
+      // profile JSON from a cookie read taken before the seed landed.
+      seedSessionKey(ses).then(function (seeded) {
+        safeRun(function () {
+          if (seeded) reloadOpenWindows();
+          pullSessionKey(ses);
+        });
+      }).catch(function () {});
       // Re-pull periodically in case the cookie change event is missed
       // (e.g. token silently refreshed without a 'changed' event).
       setInterval(function () { pullSessionKey(ses); }, 30 * 60 * 1000);
