@@ -18,7 +18,7 @@ A Bash script (`claude-deck.sh`, macOS) and its PowerShell twin (`claude-deck.ps
 ./claude-deck.sh patch --verify-launch  # (only with --app <scratch-copy>) launch + confirm it stays alive 8s
 ./claude-deck.sh revert             # restore original Claude.app from backup
 ./claude-deck.sh status             # show patch state, hashes, backup info, known profiles
-./claude-deck.sh open <name>         # launch (or focus) Claude with --profile=<name>
+./claude-deck.sh open <name>         # launch (or focus) a profile via CLAUDE_USER_DATA_DIR (+ --profile for labeling)
 ./claude-deck.sh list                # list known profiles and their cached usage
 ./claude-deck.sh dash [port]         # start the local dashboard (default port 8965)
 ./claude-deck.sh install             # copy to ~/.claude-deck/ + add zsh alias
@@ -29,6 +29,14 @@ A Bash script (`claude-deck.sh`, macOS) and its PowerShell twin (`claude-deck.ps
 `patch` and `revert` need `sudo` (writes into `/Applications/Claude.app`) and need Claude quit first. `open`, `list`, `dash`, and `status` never touch the app bundle and never need sudo.
 
 To smoke-test a change: confirm with the user, then edit the script, run `./claude-deck.sh revert` (if previously applied), then `./claude-deck.sh patch`, then `./claude-deck.sh open work` and verify the window title shows `[work]` and the profile gets its own login. `status` is the fastest sanity check between iterations.
+
+## Patch-free launch path (CLAUDE_USER_DATA_DIR)
+
+Plain-language: profile launches no longer need the patch; Claude itself supports a per-launch data dir.
+
+- `cmd_open` (and the no-script fallback in `server.js`) launches named profiles as `CLAUDE_USER_DATA_DIR="<profile dir>" open -n -a Claude --args --profile=<name>`. The env var is Claude's own hook: an unconditional top-level block in `.vite/build/index.pre.js` (verified 1.21459.0, no platform guard, also used by Anthropic's `CLAUDE_CDP_AUTH` machinery) does the same `setPath('userData', ...)` the patch injects, plus `setPath('logs', <dir>/Logs)`; a `Logs/` dir inside the profile dir is the tell that the env block ran. `open` forwards the caller's env (open(1)).
+- The `--profile` flag is still passed deliberately: `_profile_is_running`/`getRunningProfiles` detect running profiles by scanning ps args for it, and while the app is patched the injected code needs it for the `[name]` title prefix and the session-key exporter's label. An env-only launch on a *patched* app mislabels itself `default` and clobbers `profiles/default.json` (observed live). On an unpatched app the flag is inert.
+- Still patch-only: the `[name]` window-title prefix and the sessionKey exporter (dashboard key freshness). Everything else (separate logins, session-index symlink via the shell twin, running detection, dash) works patch-free. Windows twins (`claude-deck.ps1` open + `server.js` win32 fallback) don't set the env var yet.
 
 ## Architecture / how the patch works
 

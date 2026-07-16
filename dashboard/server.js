@@ -871,12 +871,31 @@ function handleOpen(req, res) {
     // running (the running check above returned early). A not-running
     // default still needs -n to force a new instance, otherwise `open -a
     // Claude` just focuses whatever profiled instance is already up and
-    // default never launches.
+    // default never launches. Named profiles launch through Claude's
+    // built-in CLAUDE_USER_DATA_DIR hook (mirrors cmd_open: works on a
+    // patched and an unpatched app; `open` forwards the environment, and
+    // the --profile flag stays for getRunningProfiles and, while patched,
+    // the injected title/exporter label).
     const args =
       name === 'default'
         ? ['-n', '-a', 'Claude']
         : ['-n', '-a', 'Claude', '--args', '--profile=' + name];
-    execFile('open', args, (err) => {
+    const opts =
+      name === 'default'
+        ? {}
+        : {
+            env: {
+              ...process.env,
+              CLAUDE_USER_DATA_DIR: path.join(
+                os.homedir(),
+                'Library',
+                'Application Support',
+                'Claude Profiles',
+                name
+              ),
+            },
+          };
+    execFile('open', args, opts, (err) => {
       if (err) return sendJson(res, 500, { ok: false, error: 'failed to launch Claude' });
       sendJson(res, 200, { ok: true });
     });

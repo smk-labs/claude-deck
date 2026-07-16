@@ -1300,7 +1300,21 @@ end tell
 OSA
   else
     step "Launching new Claude instance for profile '$name'..."
-    open -n -a "Claude" --args --profile="$name"
+    # Launch through Claude's own built-in CLAUDE_USER_DATA_DIR hook (top
+    # level of index.pre.js, unconditional, no platform guard: verified on
+    # 1.21459.0), so a profile launch no longer depends on the asar patch.
+    # `open` forwards the caller's environment to the launched app (see
+    # open(1)). The --profile flag is still passed on purpose:
+    #   - _profile_is_running and the dashboard's getRunningProfiles detect
+    #     running profiles by scanning ps args for it;
+    #   - on a still-patched app the injected code needs it for the [name]
+    #     window-title prefix and the session-key exporter's label (an
+    #     env-only launch would mislabel itself "default" and clobber
+    #     default.json).
+    # On an unpatched app the flag is inert: Electron ignores unknown
+    # switches and the env var alone does all the work.
+    CLAUDE_USER_DATA_DIR="$PROFILES_USERDATA_ROOT/$name" \
+      open -n -a "Claude" --args --profile="$name"
   fi
 }
 
