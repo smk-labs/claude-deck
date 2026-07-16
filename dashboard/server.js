@@ -879,15 +879,14 @@ function handleOpen(req, res) {
     // Falls back to a direct launch if no installed script is found.
     const script = findClaudeDeckScript();
     if (script) {
-      // orgId is only meaningful on macOS's cmd_open (claude-deck.ps1 doesn't
-      // take a 2nd arg yet); cmd_open itself does the cookie-seeding, so it
-      // is never also done here.
+      // Both cmd_open (.sh) and Cmd-Open (.ps1) take an optional org-uuid as a
+      // 2nd arg and do the cookie-seeding themselves, so it is never also done
+      // here. Pass orgId through when present on either platform.
       const cmd = IS_WIN ? 'powershell.exe' : '/bin/bash';
-      const cmdArgs = IS_WIN
+      const base = IS_WIN
         ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, 'open', name]
-        : orgId
-          ? [script, 'open', name, orgId]
-          : [script, 'open', name];
+        : [script, 'open', name];
+      const cmdArgs = orgId ? base.concat(orgId) : base;
       return execFile(cmd, cmdArgs, { windowsHide: true }, (err) => {
         if (err) return sendJson(res, 500, { ok: false, error: 'failed to launch Claude' });
         sendJson(res, 200, { ok: true });
@@ -909,12 +908,23 @@ function handleOpen(req, res) {
         if (/^(CHROME_|ELECTRON_)/.test(k)) continue;
         childEnv[k] = process.env[k];
       }
+      let winDir = null;
       if (name !== 'default') {
-        const dir = path.join(process.env.APPDATA || '', 'Claude Profiles', name);
-        try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
-        childEnv.CLAUDE_USER_DATA_DIR = dir;
+        winDir = path.join(process.env.APPDATA || '', 'Claude Profiles', name);
+        try { fs.mkdirSync(winDir, { recursive: true }); } catch (e) {}
+        childEnv.CLAUDE_USER_DATA_DIR = winDir;
       } else {
         delete childEnv.CLAUDE_USER_DATA_DIR;
+      }
+      // No Cmd-Open to delegate to here, so seed the org cookie directly,
+      // best-effort (Windows Cookies live under Network\). A failure (never
+      // logged in, node without node:sqlite) must never block the launch.
+      if (orgId && winDir) {
+        try {
+          cookieCrypto.seedOrg(path.join(winDir, 'Network', 'Cookies'), orgId);
+        } catch (e) {
+          // ignored: falls through to a normal launch
+        }
       }
       try {
         const child = spawn(exe, exeArgs, {

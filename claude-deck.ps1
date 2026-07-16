@@ -13,7 +13,9 @@
 #   .\claude-deck.ps1 patch [--force] [--verify-launch]  # apply (idempotent)
 #   .\claude-deck.ps1 revert            # restore original app.asar
 #   .\claude-deck.ps1 status            # show patch state, backup info
-#   .\claude-deck.ps1 open [name]       # launch a profile (no name = default)
+#   .\claude-deck.ps1 open [name] [org-uuid]  # launch a profile (no name =
+#                                             # default), optionally switched
+#                                             # to a specific org first
 #   .\claude-deck.ps1 list              # list known profiles
 #   .\claude-deck.ps1 dash [port]       # run the local usage dashboard
 #   .\claude-deck.ps1 doctor            # repair session-index links
@@ -74,7 +76,7 @@ $OtherMarker = 'rtl-fix.js'       # marker used by the sibling claude-rtl patch
 $ProfilesDir = Join-Path $StateDir 'profiles'
 $ProfilesUserDataRoot = Join-Path $env:APPDATA 'Claude Profiles'
 $SharedSessionsDir    = Join-Path (Join-Path $env:APPDATA 'Claude') 'claude-code-sessions'
-$LocalNodeVersion = '20.18.0'
+$LocalNodeVersion = '22.12.0'   # 22 LTS; >=22.5 gives node:sqlite for the org-switch cookie write
 $ScriptDir = $PSScriptRoot
 $CanonicalDir  = Join-Path $StateDir 'bin'
 $CanonicalPath = Join-Path $CanonicalDir 'claude-deck.ps1'
@@ -1133,7 +1135,45 @@ function Start-ClaudeInstance($name) {
   }
 }
 
-function Cmd-Open($name) {
+function Validate-OrgUuid($uuid) {
+  if ($uuid -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+    Die "Org id must be a UUID: $uuid"
+  }
+}
+
+# Splices <org> into <name>'s own lastActiveOrg cookie via
+# dashboard/cookie-crypto.js so launching lands on that org instead of
+# whatever was last active. Pure filesystem work on the profile's own Cookies
+# sqlite file: no app bundle, no patch. Never fatal: a missing cookie (never
+# logged in), a node without node:sqlite (< 22.5), or any other failure just
+# falls through to a normal launch.
+#
+# The caller (Cmd-Open) must only reach this from the "not running" branch:
+# writing to a live Cookies WAL file is externally silent (no crash, no lock
+# error) but the running app can later overwrite or ignore it, so the
+# not-running check has to gate this call through real control flow.
+function Seed-ActiveOrg($name, $org) {
+  $cookies = Join-Path (Join-Path $ProfilesUserDataRoot $name) 'Network\Cookies'
+  if (-not (Test-Path $cookies)) {
+    Note "  Profile '$name' has no Cookies file yet (never logged in): skipping org switch."
+    return
+  }
+  $helper = Join-Path (Join-Path $ScriptDir 'dashboard') 'cookie-crypto.js'
+  if (-not (Test-Path $helper)) {
+    Warn '  cookie-crypto.js not found next to this script: skipping org switch.'
+    return
+  }
+  Ensure-Node
+  Step "Switching '$name' to org $org before launch..."
+  & $script:NodeBin $helper seed-org $cookies $org 2>$null
+  switch ($LASTEXITCODE) {
+    0       { Note '  org cookie updated.' }
+    2       { Note "  '$name' has no active-org cookie yet (or this node lacks node:sqlite): launching normally." }
+    default { Warn '  could not switch org (continuing with a normal launch).' }
+  }
+}
+
+function Cmd-Open($name, $org) {
   Require-AppPaths
   if (-not $name -or $name -eq 'default') {
     if (Profile-Running 'default') {
@@ -1161,6 +1201,10 @@ function Cmd-Open($name) {
     try { $ok = $sh.AppActivate("[$name]") } catch {}
     if (-not $ok) { try { $sh.AppActivate('Claude') | Out-Null } catch {} }
   } else {
+    if ($org) {
+      Validate-OrgUuid $org
+      Seed-ActiveOrg $name $org
+    }
     Step "Launching new Claude instance for profile '$name'..."
     Start-ClaudeInstance $name
   }
@@ -1375,7 +1419,11 @@ Usage:
                          with --app <scratch-copy>, never the real install)
   claude-deck revert     restore the original app.asar from backup
   claude-deck status     show patch state, backup info, profiles
-  claude-deck open [name] launch a profile (no name = default profile)
+  claude-deck open [name] [org-uuid]
+                         launch a profile (no name = default profile). An
+                         org-uuid switches it to that org first, and only on
+                         a fresh launch (an already-running profile is just
+                         focused, org untouched)
   claude-deck list       list known profiles (running? key captured?)
   claude-deck dash [port] run the local usage dashboard (default port 8965)
   claude-deck doctor     repair every profile's session-index link, check
@@ -1399,7 +1447,7 @@ switch ($Command) {
   'patch'     { Cmd-Patch }
   'revert'    { Cmd-Revert }
   'status'    { Cmd-Status }
-  'open'      { Cmd-Open $(if ($Positional.Count -gt 0) { $Positional[0] } else { '' }) }
+  'open'      { Cmd-Open $(if ($Positional.Count -gt 0) { $Positional[0] } else { '' }) $(if ($Positional.Count -gt 1) { $Positional[1] } else { '' }) }
   'list'      { Cmd-List }
   'dash'      { Cmd-Dash $(if ($Positional.Count -gt 0) { $Positional[0] } else { '' }) }
   'doctor'    { Cmd-Doctor }
