@@ -236,6 +236,7 @@
     flex-wrap: wrap;
     gap: 10px;
   }
+  .upnext-label.upnext-sub { margin-top: 14px; }
   .upnext-pill {
     display: inline-flex;
     align-items: center;
@@ -695,6 +696,8 @@
 <div class="upnext" id="upnext" style="display:none;">
   <div class="upnext-label">Up next</div>
   <div class="upnext-row" id="upnext-row"></div>
+  <div class="upnext-label upnext-sub" id="upnext-fresh-label" style="display:none;">Untouched weeks</div>
+  <div class="upnext-row" id="upnext-fresh-row"></div>
 </div>
 
 <div class="pinned" id="pinned" style="display:none;">
@@ -1254,6 +1257,19 @@
     return Math.max.apply(null, weeklyWindows.map(function (w) { return w.utilization; }));
   }
 
+  // "Week not started": the org has weekly windows, but none carries a reset
+  // time and none has any usage. That is the API's "send your first message
+  // to start the weekly limit" state: the whole weekly budget is untouched
+  // and the clock only starts on the first message. A started org always has
+  // at least one weekly window with a reset time (a scoped bucket like Fable
+  // can show none while all-models is live), so requiring ALL of them to be
+  // bare is what separates truly idle orgs from merely light ones.
+  function orgWeekNotStarted(org) {
+    var weeklyWindows = orgWeeklyWindows(org);
+    if (!weeklyWindows.length) return false;
+    return weeklyWindows.every(function (w) { return !w.resetsAt && !w.utilization; });
+  }
+
   // "Best value" score: how much real weekly capacity is burning per hour
   // if this org sits unused. multiplier is the plan's weekly capacity
   // relative to Pro (server-derived: 20 / 6.25 / 5 / 1.25 / 1; 0 = free plan,
@@ -1460,6 +1476,9 @@
         if (org.multiplier === 0) return;
         var weeklyWindows = orgWeeklyWindows(org);
         if (!weeklyWindows.length) return;
+        // A week that has not started has no countdown to rank by: those
+        // orgs get their own "Untouched weeks" row instead.
+        if (orgWeekNotStarted(org)) return;
         var sessionPct = orgSessionUtilization(org);
         if (!orgPassesActiveFilter(profile, org, sessionPct)) return;
         var earliest = null;
@@ -1525,6 +1544,37 @@
     return candidates.slice(0, UP_NEXT_MAX);
   }
 
+  // Paid orgs whose weekly limit has not started yet: a full untouched
+  // weekly budget, waiting for its first message. Ranked by the plan's
+  // weekly capacity (multiplier) alone, biggest first, regardless of the
+  // active sort: with no usage and no countdown, capacity is the only
+  // signal there is. Free plans are dropped for the same reason they are
+  // dropped from the main row. null multiplier (unknown tier) keeps the
+  // 1x convention used by orgValueScore.
+  function buildUntouchedCandidates() {
+    var picks = [];
+    state.profiles.forEach(function (profile) {
+      var usage = state.usage[profile.name];
+      if (!hasUsageData(usage)) return;
+      (usage.orgs || []).forEach(function (org) {
+        if (!org.ok) return;
+        if (org.multiplier === 0) return;
+        if (!orgWeekNotStarted(org)) return;
+        if (!orgPassesActiveFilter(profile, org, orgSessionUtilization(org))) return;
+        picks.push({ profile: profile, org: org });
+      });
+    });
+    picks.sort(function (a, b) {
+      var am = typeof a.org.multiplier === 'number' ? a.org.multiplier : 1;
+      var bm = typeof b.org.multiplier === 'number' ? b.org.multiplier : 1;
+      if (bm !== am) return bm - am;
+      var byName = (a.profile.name || '').localeCompare(b.profile.name || '');
+      if (byName !== 0) return byName;
+      return (a.org.name || '').localeCompare(b.org.name || '');
+    });
+    return picks.slice(0, UP_NEXT_MAX);
+  }
+
   // Cursor accounts with a clear budget surplus: more of the monthly credit
   // left than time left in the cycle (ratio above 1.25), worth delegating to.
   // Cycle length is assumed 30 days; only the days-until-reset are exposed.
@@ -1556,11 +1606,16 @@
   function renderUpNext() {
     var wrap = document.getElementById('upnext');
     var row = document.getElementById('upnext-row');
+    var freshLabel = document.getElementById('upnext-fresh-label');
+    var freshRow = document.getElementById('upnext-fresh-row');
     row.innerHTML = '';
+    freshRow.innerHTML = '';
 
-    var candidates = (!state.profiles.length || state.loading) ? [] : buildUpNextCandidates();
+    var ready = state.profiles.length && !state.loading;
+    var candidates = ready ? buildUpNextCandidates() : [];
+    var untouched = ready ? buildUntouchedCandidates() : [];
     var cursorPicks = cursorUpNextPicks();
-    if (!candidates.length && !cursorPicks.length) {
+    if (!candidates.length && !cursorPicks.length && !untouched.length) {
       wrap.style.display = 'none';
       return;
     }
@@ -1608,6 +1663,24 @@
         if (section) section.scrollIntoView({ behavior: 'smooth', block: 'start' });
       });
       row.appendChild(pill);
+    });
+
+    // Untouched weeks: a second row for orgs whose weekly clock has not
+    // started. Opening one lands on that org (org-targeted open), so the
+    // first message starts the week of the org you actually picked.
+    freshLabel.style.display = untouched.length ? '' : 'none';
+    untouched.forEach(function (c) {
+      var pill = el('button', 'upnext-pill');
+      pill.type = 'button';
+      pill.title = 'Weekly limit has not started: the full week begins with the first message';
+      pill.appendChild(el('span', 'upnext-badge', monogram(c.org.name)));
+      var text = el('div', 'upnext-text');
+      text.appendChild(el('span', 'upnext-who', c.profile.name + ' · ' + (c.org.name || 'Unknown org')));
+      var plan = c.org.plan || (typeof c.org.multiplier === 'number' ? c.org.multiplier + 'x plan' : null);
+      text.appendChild(el('span', 'upnext-meta', (plan ? plan + ' · ' : '') + 'starts on first message'));
+      pill.appendChild(text);
+      pill.addEventListener('click', function () { openProfile(c.profile.name, pill, c.org.id); });
+      freshRow.appendChild(pill);
     });
   }
 

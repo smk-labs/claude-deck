@@ -609,6 +609,20 @@ const MOCK_FIXTURES = [
           seven_day: { utilization: 22, resets_hrs: 48 },
         },
       },
+      {
+        id: 'org-research-max',
+        name: 'Research Max',
+        plan: 'Max (5x)',
+        multiplier: 5,
+        // Week not started: every window 0% with no reset time (the live
+        // "send your first message to start" state). Feeds the "Untouched
+        // weeks" row; sorts below Client A Team (6.25x > 5x).
+        raw: {
+          five_hour: { utilization: 0, resets_hrs: null },
+          seven_day: { utilization: 0, resets_hrs: null },
+          seven_day_fable: { utilization: 0, resets_hrs: null },
+        },
+      },
     ],
   },
   {
@@ -628,6 +642,30 @@ const MOCK_FIXTURES = [
           seven_day_sonnet: { utilization: 15, resets_hrs: 3 },
           // A wholly new, unrecognized top-level bucket outside the seven_day_* family.
           monthly_extra: { utilization: 3, resets_hrs: 400 },
+        },
+      },
+      {
+        id: 'org-client-a-team',
+        name: 'Client A Team',
+        plan: 'Team premium',
+        multiplier: 6.25,
+        // Week not started, biggest multiplier of the untouched fixtures:
+        // proves the row sorts by capacity (6.25x first, then 5x).
+        raw: {
+          five_hour: { utilization: 0, resets_hrs: null },
+          seven_day: { utilization: 0, resets_hrs: null },
+        },
+      },
+      {
+        id: 'org-client-a-free',
+        name: 'Client A Free',
+        plan: null,
+        multiplier: 0,
+        // Week not started on a FREE org: must never reach "Untouched
+        // weeks" (multiplier 0 is filtered there like everywhere else).
+        raw: {
+          five_hour: { utilization: 0, resets_hrs: null },
+          seven_day: { utilization: 0, resets_hrs: null },
         },
       },
     ],
@@ -681,7 +719,9 @@ function mockUsage() {
       const limits = [];
       for (const key of Object.keys(org.raw)) {
         const w = org.raw[key];
-        const resets_at = hrs(w.resets_hrs);
+        // resets_hrs null = window not started (the live API returns
+        // resets_at null until the first message starts the clock).
+        const resets_at = w.resets_hrs == null ? null : hrs(w.resets_hrs);
         rawWithTimestamps[key] = { utilization: w.utilization, resets_at: resets_at };
         if (key === 'five_hour') {
           limits.push({ kind: 'session', group: 'session', percent: w.utilization, resets_at: resets_at });
