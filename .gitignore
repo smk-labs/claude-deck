@@ -1,3 +1,7 @@
 .DS_Store
 node_modules/
 *.log
+
+# migration artifacts — hold plaintext account refresh tokens, never commit
+claude-deck-tokens.json
+claude-deck-mcp.json
