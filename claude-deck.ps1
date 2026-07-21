@@ -74,8 +74,24 @@ $ClaudeRoot = Join-Path $env:LOCALAPPDATA 'AnthropicClaude'
 $Marker      = 'claude-deck.js'   # presence in asar means "patched"
 $OtherMarker = 'rtl-fix.js'       # marker used by the sibling claude-rtl patch
 $ProfilesDir = Join-Path $StateDir 'profiles'
-$ProfilesUserDataRoot = Join-Path $env:APPDATA 'Claude Profiles'
-$SharedSessionsDir    = Join-Path (Join-Path $env:APPDATA 'Claude') 'claude-code-sessions'
+# MSIX write-virtualization escape (2026-07-21): Windows virtualizes the
+# packaged app's AppData writes into %LOCALAPPDATA%\Packages\Claude_...\
+# LocalCache, forking the app's view of every profile file from the real
+# one (session saves ENOENT'd on new org dirs, archives silently
+# reverted). Data dirs therefore live OUTSIDE the virtualized known
+# folders, at ~\ClaudeProfiles (default instance included, as
+# ~\ClaudeProfiles\default). The migration script creates that root;
+# until it exists every path stays legacy, so nothing changes behavior
+# before the one-time migration has run.
+$EscapedDataRoot = Join-Path $env:USERPROFILE 'ClaudeProfiles'
+if (Test-Path -LiteralPath $EscapedDataRoot) {
+  $ProfilesUserDataRoot = $EscapedDataRoot
+  $DefaultUserDataDir   = Join-Path $EscapedDataRoot 'default'
+} else {
+  $ProfilesUserDataRoot = Join-Path $env:APPDATA 'Claude Profiles'
+  $DefaultUserDataDir   = Join-Path $env:APPDATA 'Claude'
+}
+$SharedSessionsDir = Join-Path $DefaultUserDataDir 'claude-code-sessions'
 $LocalNodeVersion = '22.12.0'   # 22 LTS; >=22.5 gives node:sqlite for the org-switch cookie write
 $ScriptDir = $PSScriptRoot
 $CanonicalDir  = Join-Path $StateDir 'bin'
@@ -1058,6 +1074,10 @@ function Ensure-ProfileIndexLink($name) {
   $profileDir = Join-Path $ProfilesUserDataRoot $name
   $link = Join-Path $profileDir 'claude-code-sessions'
 
+  # Under the escaped root the default instance's own dir hosts the shared
+  # index physically; linking it onto itself would be circular.
+  if ($link -ieq $SharedSessionsDir) { return $true }
+
   New-Item -ItemType Directory -Force -Path $SharedSessionsDir | Out-Null
   New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
 
@@ -1126,6 +1146,16 @@ function Start-ClaudeInstance($name) {
     $env:CLAUDE_USER_DATA_DIR = $dir
     try {
       Start-Process -FilePath $Exe -ArgumentList "--profile=$name" -WorkingDirectory $AppDir
+    } finally {
+      Remove-Item Env:CLAUDE_USER_DATA_DIR -ErrorAction SilentlyContinue
+    }
+  } elseif ($ProfilesUserDataRoot -eq $EscapedDataRoot) {
+    # Escaped root active: the default instance must also live outside the
+    # virtualized AppData, or its writes keep landing in the MSIX overlay.
+    New-Item -ItemType Directory -Force -Path $DefaultUserDataDir | Out-Null
+    $env:CLAUDE_USER_DATA_DIR = $DefaultUserDataDir
+    try {
+      Start-Process -FilePath $Exe -WorkingDirectory $AppDir
     } finally {
       Remove-Item Env:CLAUDE_USER_DATA_DIR -ErrorAction SilentlyContinue
     }
