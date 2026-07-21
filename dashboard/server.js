@@ -951,9 +951,22 @@ function handleOpen(req, res) {
         if (/^(CHROME_|ELECTRON_)/.test(k)) continue;
         childEnv[k] = process.env[k];
       }
+      // MSIX write-virtualization escape: once the migrated ~\ClaudeProfiles
+      // root exists, every data dir (default included) lives there, outside
+      // the AppData known folder Windows virtualizes for the packaged app.
+      // Until then, legacy AppData paths.
+      const escapedRoot = path.join(os.homedir(), 'ClaudeProfiles');
+      let hasEscapedRoot = false;
+      try { hasEscapedRoot = fs.existsSync(escapedRoot); } catch (e) {}
       let winDir = null;
       if (name !== 'default') {
-        winDir = path.join(process.env.APPDATA || '', 'Claude Profiles', name);
+        winDir = hasEscapedRoot
+          ? path.join(escapedRoot, name)
+          : path.join(process.env.APPDATA || '', 'Claude Profiles', name);
+        try { fs.mkdirSync(winDir, { recursive: true }); } catch (e) {}
+        childEnv.CLAUDE_USER_DATA_DIR = winDir;
+      } else if (hasEscapedRoot) {
+        winDir = path.join(escapedRoot, 'default');
         try { fs.mkdirSync(winDir, { recursive: true }); } catch (e) {}
         childEnv.CLAUDE_USER_DATA_DIR = winDir;
       } else {
