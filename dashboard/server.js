@@ -373,10 +373,13 @@ function multiplierFor(org, seatTier) {
 // Replaces the old single-org ensureOrgId: a single login can belong to
 // several organizations (e.g. two Team orgs + a personal Max org), each with
 // its own independent usage pool, so every chat-capable org is kept.
-async function ensureAccount(name, profile) {
+// `force` (the UI's fresh=1) skips the 24h cache so a plan change on
+// claude.ai shows up on manual refresh instead of a day later.
+async function ensureAccount(name, profile, force) {
   const cachedOrgs = Array.isArray(profile.orgs) ? profile.orgs : null;
   const fetchedAt = profile.orgsFetchedAt ? new Date(profile.orgsFetchedAt).getTime() : 0;
   const isFresh =
+    !force &&
     cachedOrgs &&
     cachedOrgs.length > 0 &&
     Date.now() - fetchedAt < ORGS_MAX_AGE_MS &&
@@ -526,8 +529,8 @@ async function fetchUsageForOrg(org, sessionKey) {
   }
 }
 
-async function fetchUsageForProfile(name, profile) {
-  const { orgs, email } = await ensureAccount(name, profile);
+async function fetchUsageForProfile(name, profile, fresh) {
+  const { orgs, email } = await ensureAccount(name, profile, fresh);
   const results = await Promise.allSettled(
     orgs.map((org) => fetchUsageForOrg(org, profile.sessionKey))
   );
@@ -783,7 +786,7 @@ async function handleUsage(req, res, query) {
       }
 
       try {
-        const data = await fetchUsageForProfile(name, profile);
+        const data = await fetchUsageForProfile(name, profile, fresh);
         data.running = isRunning;
         USAGE_CACHE.set(name, { at: Date.now(), data });
         return data;
