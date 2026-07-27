@@ -1,9 +1,11 @@
-// Chromium v10 cookie crypto for one specific job: splice a different org
-// UUID into a claude-deck profile's own `lastActiveOrg` cookie so opening it
-// lands on that org, instead of whatever was last active. No asar, no app
-// bundle, no patch: this only ever touches a profile's own Cookies sqlite
-// file (macOS: "~/Library/Application Support/Claude Profiles/<name>/Cookies";
-// Windows: "%APPDATA%\Claude Profiles\<name>\Network\Cookies").
+// Chromium v10 cookie crypto for two jobs, both against a profile's own
+// Cookies sqlite file (macOS: "~/Library/Application Support/Claude
+// Profiles/<name>/Cookies"; Windows: "<profile dir>\Network\Cookies"). No
+// asar, no app bundle, no patch:
+//   seedOrg        splices a different org UUID into the `lastActiveOrg`
+//                  cookie, so opening the profile lands on that org.
+//   readSessionKey reads the claude.ai `sessionKey` cookie, which is what
+//                  the dashboard authenticates with.
 //
 // The plaintext of the lastActiveOrg cookie is [N leading bytes][36-byte org
 // UUID]. seedOrg never assumes/fabricates the leading bytes: it decrypts the
@@ -37,7 +39,22 @@ const FIXED_IV = Buffer.alloc(16, ' ');
 
 // ---- key derivation ----
 
+// One derivation per process: on macOS this shells out to the keychain, on
+// Windows to DPAPI, and readSessionKey can be called for several profiles on
+// every dashboard poll. Cached per db path because the Windows key is
+// per-profile while the macOS one is a single shared keychain item.
+const KEY_CACHE = new Map();
+
 function deriveKey(cookiesDb) {
+  const cacheKey = IS_WIN ? cookiesDb : 'mac';
+  const cached = KEY_CACHE.get(cacheKey);
+  if (cached) return cached;
+  const key = deriveKeyUncached(cookiesDb);
+  KEY_CACHE.set(cacheKey, key);
+  return key;
+}
+
+function deriveKeyUncached(cookiesDb) {
   if (IS_WIN) {
     // Per-profile AES key: DPAPI-unprotect Local State os_crypt.encrypted_key.
     // node has no DPAPI, so unprotect via a one-shot PowerShell call. Cookies
@@ -117,18 +134,29 @@ function getNodeSqlite() {
   }
 }
 
-const SQL_SELECT =
-  "SELECT hex(encrypted_value) AS hex FROM cookies WHERE host_key='.claude.ai' AND name='lastActiveOrg'";
 const SQL_UPDATE =
   "UPDATE cookies SET encrypted_value = ? WHERE host_key='.claude.ai' AND name='lastActiveOrg'";
 
-function readEncryptedLastActiveOrg(cookiesDb) {
+// Cookie names are always literals from this file's own callers, never user
+// input, and the letters-only assertion keeps that structurally true: the
+// macOS path builds SQL text for the sqlite3 CLI, which takes no parameters.
+function selectSql(cookieName) {
+  if (!/^[A-Za-z]+$/.test(cookieName)) throw new Error('bad-cookie-name');
+  return (
+    "SELECT hex(encrypted_value) AS hex FROM cookies WHERE host_key='.claude.ai' AND name='" +
+    cookieName +
+    "'"
+  );
+}
+
+function readEncryptedCookie(cookiesDb, cookieName) {
+  const sql = selectSql(cookieName);
   if (IS_WIN) {
     const sqlite = getNodeSqlite();
     if (!sqlite) throw new Error('no-sqlite');
     const db = new sqlite.DatabaseSync(cookiesDb);
     try {
-      const row = db.prepare(SQL_SELECT).get();
+      const row = db.prepare(sql).get();
       return row && row.hex ? Buffer.from(row.hex, 'hex') : null;
     } finally {
       db.close();
@@ -136,7 +164,12 @@ function readEncryptedLastActiveOrg(cookiesDb) {
   }
   // immutable=1: a plain read never contends with a running Claude's WAL lock.
   const uri = 'file:' + cookiesDb + '?immutable=1';
-  const out = execFileSync('sqlite3', ['-json', uri, SQL_SELECT + ';'], { encoding: 'utf8' });
+  // stderr ignored: "unable to open database" is the normal answer for a
+  // profile that has never been launched, and the dashboard polls this.
+  const out = execFileSync('sqlite3', ['-json', uri, sql + ';'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
   const rows = JSON.parse(out || '[]');
   return rows.length && rows[0].hex ? Buffer.from(rows[0].hex, 'hex') : null;
 }
@@ -174,7 +207,7 @@ function seedOrg(cookiesDb, orgUuid) {
 
   let current;
   try {
-    current = readEncryptedLastActiveOrg(cookiesDb);
+    current = readEncryptedCookie(cookiesDb, 'lastActiveOrg');
   } catch (e) {
     if (e && e.message === 'no-sqlite') return { ok: false, reason: 'no-sqlite' };
     return { ok: false, reason: 'no-cookie' };
@@ -191,7 +224,53 @@ function seedOrg(cookiesDb, orgUuid) {
   return { ok: true };
 }
 
-module.exports = { seedOrg, decryptV10, encryptV10, deriveKey, UUID_RE };
+// ---- reading a profile's session key ----
+
+function cookiesDbFor(userDataDir) {
+  return IS_WIN
+    ? path.join(userDataDir, 'Network', 'Cookies')
+    : path.join(userDataDir, 'Cookies');
+}
+
+// Reads a profile's own claude.ai sessionKey out of its cookie store, read
+// only, with no patch involved. This is the dashboard's fallback source for
+// the key: while the app is patched the injected exporter keeps
+// ~/.claude-deck/profiles/<name>.json up to date, but a Claude update
+// silently reverts the patch (and Windows MSIX retired it entirely), and a
+// profile whose key was never exported used to be invisible in the dashboard
+// even after a real login.
+//
+// Chromium prefixes the cookie plaintext with the 32-byte SHA-256 of the
+// host_key (verified live: sha256('.claude.ai') is byte-for-byte the leading
+// 32 bytes of a decrypted claude.ai cookie). The 'sk-ant-' marker is
+// preferred over a blind 32-byte cut so a future prefix change can't silently
+// corrupt the key; the cut is the fallback if the token prefix ever changes.
+// Returns null on every failure path: no keychain access, no cookie row, an
+// undecryptable blob (a profile copied from another machine), or a value that
+// does not look like a bearer token.
+const HOST_HASH_LEN = 32;
+
+function readSessionKey(userDataDir) {
+  const cookiesDb = cookiesDbFor(userDataDir);
+  try {
+    // Checked, not just attempted: the sqlite3 CLI creates an empty database
+    // file when asked to open a path that does not exist, and a read has no
+    // business leaving anything behind in a profile that was never launched.
+    if (!fs.existsSync(cookiesDb)) return null;
+    const blob = readEncryptedCookie(cookiesDb, 'sessionKey');
+    if (!blob) return null;
+    const plain = decryptV10(deriveKey(cookiesDb), blob);
+    if (!plain) return null;
+    const at = plain.indexOf('sk-ant-', 0, 'utf8');
+    const raw = at >= 0 ? plain.slice(at) : plain.slice(HOST_HASH_LEN);
+    const value = raw.toString('utf8').trim();
+    return /^[\x21-\x7e]{20,}$/.test(value) ? value : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+module.exports = { seedOrg, readSessionKey, cookiesDbFor, decryptV10, encryptV10, deriveKey, UUID_RE };
 
 if (require.main === module) {
   const [, , cmd, cookiesDb, orgUuid] = process.argv;

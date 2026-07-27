@@ -118,6 +118,128 @@ function listProfileFiles() {
   }
 }
 
+// Where the per-profile Electron userData dirs live. On Windows the migrated
+// ~\ClaudeProfiles root wins once it exists (it sits outside the AppData
+// folder Windows write-virtualizes for the packaged app); until then, legacy
+// AppData. Mirrors PROFILES_USERDATA_ROOT in the shell script.
+function profilesUserDataRoot() {
+  if (IS_WIN) {
+    const escaped = path.join(os.homedir(), 'ClaudeProfiles');
+    try {
+      if (fs.existsSync(escaped)) return escaped;
+    } catch (e) {
+      // fall through to the legacy root
+    }
+    return path.join(process.env.APPDATA || '', 'Claude Profiles');
+  }
+  return path.join(os.homedir(), 'Library', 'Application Support', 'Claude Profiles');
+}
+
+function profileUserDataDir(name) {
+  return path.join(profilesUserDataRoot(), name);
+}
+
+function listProfileDirs() {
+  try {
+    return fs
+      .readdirSync(profilesUserDataRoot(), { withFileTypes: true })
+      .filter((e) => e.isDirectory() || e.isSymbolicLink())
+      .map((e) => e.name);
+  } catch (e) {
+    return [];
+  }
+}
+
+// The set of profiles that EXIST is the set of data dirs, not the set of
+// exported session keys. A brand-new profile has a data dir immediately and a
+// key file only later (and never at all while the app is unpatched), so
+// listing key files alone made a real, logged-in profile invisible here while
+// `claude-deck list` showed it. Same union cmd_list takes: key files + data
+// dirs + anything currently running. Names are validated, so a stray
+// directory (or a .DS_Store) can never become a card.
+function listProfileNames(running) {
+  const out = [];
+  const seen = new Set();
+  const add = (name) => {
+    if (!validName(name) || seen.has(name)) return;
+    seen.add(name);
+    out.push(name);
+  };
+  listProfileFiles().forEach((f) => add(path.basename(f, '.json')));
+  listProfileDirs().forEach(add);
+  if (running) running.forEach(add);
+  return out.sort();
+}
+
+// Session keys, without the patch. The injected exporter writes
+// profiles/<name>.json only while Claude.app is patched, so on an unpatched
+// app (a Claude update reverts the patch silently; Windows MSIX retired it)
+// the dashboard has no credential for any profile, however well logged in it
+// is. The key is also sitting in the profile's own cookie store, so read it
+// from there and write the same JSON the exporter would have: one place to
+// fix, and everything downstream (usage, hasKey, the cached org list,
+// `claude-deck list`) keeps working unchanged.
+const KEY_PROBE_MS = 60 * 1000;
+const KEY_PROBE_AT = new Map(); // name -> last probe time, successful or not
+
+function keyFromCookies(name) {
+  if (name === 'default') {
+    // The flag-less instance uses the app's own userData dir, not a profile dir.
+    const base = IS_WIN
+      ? path.join(profilesUserDataRoot(), 'default')
+      : path.join(os.homedir(), 'Library', 'Application Support', 'Claude');
+    return cookieCrypto.readSessionKey(base);
+  }
+  return cookieCrypto.readSessionKey(profileUserDataDir(name));
+}
+
+// Fills in any missing session key from the cookie store, throttled so a
+// profile that has genuinely never been logged into is not re-probed on every
+// poll. Returns nothing: callers just re-read the profile JSONs afterwards.
+function ensureProfileKeys(names) {
+  for (const name of names) {
+    const filePath = path.join(PROFILES_DIR, name + '.json');
+    const current = readJsonSafe(filePath);
+    if (current && current.sessionKey) continue;
+    const last = KEY_PROBE_AT.get(name) || 0;
+    if (Date.now() - last < KEY_PROBE_MS) continue;
+    KEY_PROBE_AT.set(name, Date.now());
+    let key = null;
+    try {
+      key = keyFromCookies(name);
+    } catch (e) {
+      key = null;
+    }
+    if (!key) continue;
+    writeProfileJson(
+      name,
+      Object.assign({ name }, current, { sessionKey: key, updatedAt: new Date().toISOString() })
+    );
+  }
+}
+
+// Re-reads the key from the cookie store after an auth failure and reports
+// whether it actually changed, so handleUsage can retry once instead of
+// showing "session key expired" for a profile that has already logged back
+// in. While the app is patched the injected exporter does this refresh; this
+// is the same job, done from outside.
+function refreshKeyFromCookies(name, staleKey) {
+  let key = null;
+  try {
+    key = keyFromCookies(name);
+  } catch (e) {
+    return null;
+  }
+  if (!key || key === staleKey) return null;
+  const filePath = path.join(PROFILES_DIR, name + '.json');
+  const current = readJsonSafe(filePath) || { name };
+  writeProfileJson(
+    name,
+    Object.assign({}, current, { sessionKey: key, updatedAt: new Date().toISOString() })
+  );
+  return key;
+}
+
 function validName(name) {
   return typeof name === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(name);
 }
@@ -525,7 +647,11 @@ async function fetchUsageForOrg(org, sessionKey) {
     const windows = normalizeUsage(raw);
     return { id: org.id, name: org.name, plan: org.plan, multiplier: org.multiplier !== undefined ? org.multiplier : null, ok: true, windows };
   } catch (e) {
-    return { id: org.id, name: org.name, plan: org.plan, multiplier: org.multiplier !== undefined ? org.multiplier : null, ok: false, error: e.message };
+    // authError travels with the org result. A rotated session key fails
+    // every org call, while ensureAccount's cached-org fallback keeps the
+    // profile-level call from throwing at all, so this flag is the only
+    // thing that tells handleUsage the key (not the org) is the problem.
+    return { id: org.id, name: org.name, plan: org.plan, multiplier: org.multiplier !== undefined ? org.multiplier : null, ok: false, error: e.message, authError: Boolean(e.authError) };
   }
 }
 
@@ -537,7 +663,7 @@ async function fetchUsageForProfile(name, profile, fresh) {
   const orgResults = results.map((r, i) => {
     if (r.status === 'fulfilled') return r.value;
     const org = orgs[i];
-    return { id: org.id, name: org.name, plan: org.plan, multiplier: org.multiplier !== undefined ? org.multiplier : null, ok: false, error: String((r.reason && r.reason.message) || r.reason || 'unknown error') };
+    return { id: org.id, name: org.name, plan: org.plan, multiplier: org.multiplier !== undefined ? org.multiplier : null, ok: false, error: String((r.reason && r.reason.message) || r.reason || 'unknown error'), authError: Boolean(r.reason && r.reason.authError) };
   });
   return { name, email, running: false, ok: true, orgs: orgResults };
 }
@@ -750,10 +876,10 @@ function mockUsage() {
 async function handleProfiles(req, res) {
   if (MOCK) return sendJson(res, 200, mockProfiles());
   const running = await getRunningProfiles();
-  const files = listProfileFiles();
-  const profiles = files.map((filePath) => {
-    const data = readJsonSafe(filePath) || {};
-    const name = path.basename(filePath, '.json');
+  const names = listProfileNames(running);
+  ensureProfileKeys(names);
+  const profiles = names.map((name) => {
+    const data = readJsonSafe(path.join(PROFILES_DIR, name + '.json')) || {};
     return {
       name,
       hasKey: Boolean(data.sessionKey),
@@ -769,15 +895,15 @@ async function handleUsage(req, res, query) {
 
   const fresh = query.get('fresh') === '1';
   const running = await getRunningProfiles();
-  const files = listProfileFiles();
+  const names = listProfileNames(running);
+  ensureProfileKeys(names);
 
   const results = await Promise.allSettled(
-    files.map(async (filePath) => {
-      const name = path.basename(filePath, '.json');
-      const profile = readJsonSafe(filePath);
+    names.map(async (name) => {
+      const profile = readJsonSafe(path.join(PROFILES_DIR, name + '.json'));
       const isRunning = running.has(name);
       if (!profile || !profile.sessionKey) {
-        return { name, running: isRunning, ok: false, error: 'no session key on file yet' };
+        return { name, running: isRunning, ok: false, error: 'not logged in yet: open this profile and sign in' };
       }
 
       const cached = USAGE_CACHE.get(name);
@@ -785,13 +911,46 @@ async function handleUsage(req, res, query) {
         return Object.assign({}, cached.data, { running: isRunning });
       }
 
+      // A stale key gets exactly one retry with whatever the profile's own
+      // cookie store currently holds. Signing in again rotates the cookie,
+      // and with the app unpatched nothing writes the new value into
+      // profiles/<name>.json, so without this a re-logged-in profile would
+      // read as "expired" until something else refreshed it. The retry only
+      // happens when the cookie really holds a different key.
+      const retryWithFreshKey = async () => {
+        const newer = refreshKeyFromCookies(name, profile.sessionKey);
+        if (!newer) return null;
+        return fetchUsageForProfile(name, Object.assign({}, profile, { sessionKey: newer }), fresh);
+      };
+
       try {
-        const data = await fetchUsageForProfile(name, profile, fresh);
+        let data = await fetchUsageForProfile(name, profile, fresh);
+        if ((data.orgs || []).some((o) => o.authError)) {
+          try {
+            const retried = await retryWithFreshKey();
+            if (retried) data = retried;
+          } catch (e2) {
+            // Keep the first answer: it at least names the orgs.
+          }
+        }
         data.running = isRunning;
         USAGE_CACHE.set(name, { at: Date.now(), data });
         return data;
-      } catch (e) {
-        const errData = { name, running: isRunning, ok: false, error: e.message };
+      } catch (err) {
+        let failure = err;
+        if (err.authError) {
+          try {
+            const retried = await retryWithFreshKey();
+            if (retried) {
+              retried.running = isRunning;
+              USAGE_CACHE.set(name, { at: Date.now(), data: retried });
+              return retried;
+            }
+          } catch (e2) {
+            failure = e2;
+          }
+        }
+        const errData = { name, running: isRunning, ok: false, error: failure.message };
         USAGE_CACHE.set(name, { at: Date.now(), data: errData });
         return errData;
       }
@@ -800,8 +959,7 @@ async function handleUsage(req, res, query) {
 
   const profiles = results.map((r, i) => {
     if (r.status === 'fulfilled') return r.value;
-    const name = path.basename(files[i], '.json');
-    return { name, running: false, ok: false, error: r.reason ? String(r.reason.message || r.reason) : 'unknown error' };
+    return { name: names[i], running: false, ok: false, error: r.reason ? String(r.reason.message || r.reason) : 'unknown error' };
   });
 
   sendJson(res, 200, { fetchedAt: new Date().toISOString(), profiles });
@@ -863,8 +1021,59 @@ function handleCursorOpen(req, res) {
   });
 }
 
-function profileUserDataDir(name) {
-  return path.join(os.homedir(), 'Library', 'Application Support', 'Claude Profiles', name);
+// Creating a profile is just creating its data dir: the app builds the rest
+// on first launch, and listProfileNames picks the dir up immediately, so the
+// card appears without waiting for a login. The caller then opens it (through
+// the normal /api/open path, which self-heals the shared session-index link)
+// so the user can sign in. Deliberately never touches an existing profile.
+function handleCreateProfile(req, res) {
+  let body = '';
+  let tooLarge = false;
+  req.on('data', (chunk) => {
+    body += chunk;
+    if (body.length > 1024) {
+      tooLarge = true;
+      req.destroy();
+    }
+  });
+  req.on('end', () => {
+    if (tooLarge) return sendJson(res, 413, { ok: false, error: 'body too large' });
+
+    let parsed;
+    try {
+      parsed = JSON.parse(body || '{}');
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: 'invalid JSON' });
+    }
+
+    const name = parsed.name;
+    if (!validName(name)) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: 'use letters, numbers, dashes or underscores (up to 32)',
+      });
+    }
+    if (name === 'default') {
+      return sendJson(res, 400, { ok: false, error: '"default" is the unprofiled instance, pick another name' });
+    }
+    if (MOCK) return sendJson(res, 200, { ok: true, name });
+
+    const dir = profileUserDataDir(name);
+    let exists = false;
+    try {
+      exists = fs.existsSync(dir) || fs.existsSync(path.join(PROFILES_DIR, name + '.json'));
+    } catch (e) {
+      // treat an unreadable check as "does not exist" and let mkdir decide
+    }
+    if (exists) return sendJson(res, 409, { ok: false, error: 'a profile called ' + name + ' already exists' });
+
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, error: 'could not create the profile folder' });
+    }
+    sendJson(res, 200, { ok: true, name });
+  });
 }
 
 function handleOpen(req, res) {
@@ -1111,6 +1320,12 @@ const server = http.createServer((req, res) => {
       sendJson(res, 200, { ok: true, pins });
     });
     return;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/profiles') {
+    if (req.headers['x-claude-deck'] !== '1') {
+      return sendJson(res, 403, { ok: false, error: 'forbidden' });
+    }
+    return handleCreateProfile(req, res);
   }
   if (req.method === 'POST' && url.pathname === '/api/cursor/open') {
     if (req.headers['x-claude-deck'] !== '1') {
