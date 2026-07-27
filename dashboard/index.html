@@ -187,6 +187,69 @@
     background: var(--accent);
     color: var(--accent-fg);
   }
+  .toolbar-right {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+  .newprofile { position: relative; display: inline-flex; align-items: center; }
+  button.newprofile-btn,
+  .newprofile-form button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--accent);
+    padding: 5px 13px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease;
+  }
+  button.newprofile-btn:hover,
+  .newprofile-form button:hover {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-fg);
+  }
+  button.newprofile-btn:disabled { opacity: 0.5; cursor: default; }
+  /* An explicit display beats the UA [hidden] rule, so restate it. */
+  button.newprofile-btn[hidden] { display: none; }
+  .newprofile-form { display: inline-flex; align-items: center; gap: 6px; }
+  .newprofile-form[hidden] { display: none; }
+  .newprofile-cancel { color: var(--muted) !important; }
+  .newprofile-cancel:hover { background: var(--track) !important; border-color: var(--border) !important; color: var(--text) !important; }
+  input.newprofile-input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 5px 13px;
+    font-size: 13px;
+    font-family: inherit;
+    width: 140px;
+  }
+  input.newprofile-input:focus { outline: none; border-color: var(--accent); }
+  .newprofile-note {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 12;
+    max-width: 320px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: var(--muted);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+  }
+  .newprofile-note[hidden] { display: none; }
+  .newprofile-note.bad { color: var(--red); border-color: var(--red); }
   .sort-control {
     display: inline-flex;
     align-items: center;
@@ -679,17 +742,43 @@
     <button type="button" data-filter="headroom">Has headroom</button>
     <button type="button" data-filter="running">Running</button>
   </div>
-  <div class="sort-control">
-    <label for="sort-select">Sort:</label>
-    <select class="sort-select" id="sort-select">
-      <option value="best-value">Best value first</option>
-      <option value="weekly-reset-soonest">Weekly reset: soonest</option>
-      <option value="session-used-asc">Session used: low to high</option>
-      <option value="session-used-desc">Session used: high to low</option>
-      <option value="weekly-used-asc">Weekly used: low to high</option>
-      <option value="weekly-used-desc">Weekly used: high to low</option>
-      <option value="name">Name</option>
-    </select>
+  <div class="toolbar-right">
+    <div class="sort-control">
+      <label for="sort-select">Sort:</label>
+      <select class="sort-select" id="sort-select">
+        <option value="best-value">Best value first</option>
+        <option value="weekly-reset-soonest">Weekly reset: soonest</option>
+        <option value="session-used-asc">Session used: low to high</option>
+        <option value="session-used-desc">Session used: high to low</option>
+        <option value="weekly-used-asc">Weekly used: low to high</option>
+        <option value="weekly-used-desc">Weekly used: high to low</option>
+        <option value="name">Name</option>
+      </select>
+    </div>
+    <div class="newprofile">
+      <button type="button" class="newprofile-btn" id="newprofile-btn" aria-expanded="false">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        New profile
+      </button>
+      <form class="newprofile-form" id="newprofile-form" hidden>
+        <input
+          type="text"
+          id="newprofile-name"
+          class="newprofile-input"
+          placeholder="Profile name"
+          maxlength="32"
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="New profile name"
+        />
+        <button type="submit" class="newprofile-add" id="newprofile-add">Add and log in</button>
+        <button type="button" class="newprofile-cancel" id="newprofile-cancel">Cancel</button>
+      </form>
+      <div class="newprofile-note" id="newprofile-note" hidden></div>
+    </div>
   </div>
 </div>
 
@@ -1209,8 +1298,8 @@
     wrap.appendChild(el('p', 'lead', 'Set up Claude Deck to run multiple accounts side by side.'));
     var steps = el('ol', 'steps');
     var items = [
-      'Run <code>claude-deck patch</code> to prepare Claude Desktop.',
-      'Run <code>claude-deck open work</code> and log in.',
+      'Click <b>New profile</b> above and give it a name.',
+      'Log in inside the Claude window that opens.',
       'Usage appears here automatically.'
     ];
     items.forEach(function (html, i) {
@@ -1793,14 +1882,49 @@
     }).catch(done);
   }
 
+  // One signature per profile list, so the frequent poll below can tell a
+  // real change (a profile appeared, a window opened or closed, a login
+  // landed) from an identical answer and skip re-rendering the grid.
+  function profilesFingerprint(list) {
+    return list.map(function (p) {
+      return p.name + ':' + (p.running ? 1 : 0) + ':' + (p.hasKey ? 1 : 0);
+    }).join('|');
+  }
+
+  // Returns true when some profile now needs usage it does not have yet:
+  // brand new, or logged in since the last poll.
+  function applyProfiles(list) {
+    var prev = {};
+    state.profiles.forEach(function (p) { prev[p.name] = p; });
+    var changed = state.loading || profilesFingerprint(list) !== profilesFingerprint(state.profiles);
+    var needUsage = list.some(function (p) {
+      var was = prev[p.name];
+      return !was || (p.hasKey && !was.hasKey);
+    });
+    state.profiles = list;
+    state.loading = false;
+    if (changed) render();
+    return needUsage;
+  }
+
   function loadProfiles() {
     return fetch('/api/profiles').then(function (r) { return r.json(); }).then(function (data) {
-      state.profiles = data || [];
-      state.loading = false;
-      render();
+      applyProfiles(data || []);
     }).catch(function () {
       state.loading = false;
       render();
+    });
+  }
+
+  // Profiles are discovered from their data dirs, so one created outside the
+  // dashboard (claude-deck open <name>, or another browser tab) shows up on
+  // its own. The list is cheap to read, so it is polled far more often than
+  // usage instead of waiting for the 5-minute refresh.
+  function syncProfiles() {
+    return fetch('/api/profiles').then(function (r) { return r.json(); }).then(function (data) {
+      if (applyProfiles(data || [])) loadUsage(false);
+    }).catch(function () {
+      // A transient failure just means the next tick tries again.
     });
   }
 
@@ -1844,6 +1968,65 @@
     refreshAll(true);
   });
 
+  // ---- new profile ----
+  // Creating a profile is two steps on purpose: make the folder (the card
+  // appears at once), then open it through the same launch path the Open
+  // button uses, so the user lands in a fresh Claude window to sign in.
+  var npBtn = document.getElementById('newprofile-btn');
+  var npForm = document.getElementById('newprofile-form');
+  var npInput = document.getElementById('newprofile-name');
+  var npNote = document.getElementById('newprofile-note');
+  var NAME_RE = /^[A-Za-z0-9_-]{1,32}$/;
+
+  function npSay(msg, bad) {
+    if (!msg) { npNote.hidden = true; npNote.textContent = ''; return; }
+    npNote.textContent = msg;
+    npNote.classList.toggle('bad', !!bad);
+    npNote.hidden = false;
+  }
+
+  function npOpen(open) {
+    npBtn.hidden = open;
+    npBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    npForm.hidden = !open;
+    npSay('');
+    if (open) { npInput.value = ''; npInput.focus(); }
+  }
+
+  npBtn.addEventListener('click', function () { npOpen(true); });
+  document.getElementById('newprofile-cancel').addEventListener('click', function () { npOpen(false); });
+  npInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') npOpen(false);
+  });
+
+  npForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var name = npInput.value.trim();
+    if (!NAME_RE.test(name)) {
+      return npSay('Use letters, numbers, dashes or underscores (up to 32).', true);
+    }
+    npSay('Creating ' + name + '...');
+    fetch('/api/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Claude-Deck': '1' },
+      body: JSON.stringify({ name: name })
+    }).then(function (r) {
+      return r.json().then(function (data) { return { status: r.status, data: data }; });
+    }).then(function (res) {
+      if (!res.data || !res.data.ok) {
+        return npSay((res.data && res.data.error) || 'Could not create the profile.', true);
+      }
+      npOpen(false);
+      npSay('Opening ' + name + ': log in there and its usage shows up here.');
+      setTimeout(function () { npSay(''); }, 8000);
+      return loadProfiles().then(function () {
+        openProfile(name, npBtn);
+      });
+    }).catch(function () {
+      npSay('Could not reach the dashboard server.', true);
+    });
+  });
+
   document.querySelectorAll('#filter-segmented button').forEach(function (btn) {
     btn.addEventListener('click', function () {
       state.filter = btn.dataset.filter;
@@ -1865,6 +2048,7 @@
   loadServerPins();
   refreshAll(false);
   setInterval(function () { refreshAll(false); }, 5 * 60 * 1000);
+  setInterval(syncProfiles, 20 * 1000);
   setInterval(tickUpdated, 1000);
   setInterval(tickResets, 30 * 1000);
 })();

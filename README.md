@@ -13,6 +13,7 @@
 - **Unlimited simultaneous logins from one app copy.** No duplicate 700MB Claude.app bundles per account.
 - **Every profile shares the same `~/.claude`.** Claude Code sessions, config, and settings are identical across every account you log into.
 - **A local dashboard** showing usage per account AND per organization (an account in several orgs gets one section per org), rendering usage windows dynamically from whatever the API returns, so new model buckets (like a Fable weekly limit) show up automatically with no code change, with one-click open or focus per profile.
+- **Add profiles from the dashboard.** Click **New profile**, name it, and Claude opens on that profile so you can log in. Profiles made anywhere else (`claude-deck open <name>`, another browser tab) show up on their own within seconds: the dashboard lists profile folders, not just the ones it has a key for.
 - **Window titles tagged `[profile]`** so Cmd-backtick, Mission Control, and Raycast can tell your accounts apart.
 - **Optional Cursor integration.** See idle [Cursor](https://cursor.com) seats' usage in the same dashboard, and delegate self-contained tasks to them from Claude Code (agent calling). Zero dependency, off by default. See [Cursor accounts](#cursor-accounts-optional).
 
@@ -78,6 +79,7 @@ The same commands work on Windows via `claude-deck.ps1` (except `watchdog`, see 
 - **Entitlements are stripped, not just preserved.** An ad-hoc signature can never carry Apple's restricted entitlements (app identifier, team identifier, keychain groups); macOS's stricter checks on Apple Silicon refuse to launch a binary that has them anyway. The script reads the app's own entitlements, drops those three keys, and adds one that lets the ad-hoc binary still load Electron's genuinely-signed nested framework. See "macOS signing" below.
 - **`--profile=NAME` launch flag.** Each profile gets its own Electron `userData` folder under `~/Library/Application Support/Claude Profiles/<name>`, which is what gives it a separate, simultaneous login.
 - **Session reporter.** The injected code reads each profile's session cookie and writes it to `~/.claude-deck/profiles/<name>.json`, which the dashboard reads to show usage.
+- **The dashboard does not need the patch.** When a profile has no exported key (unpatched app, or a login that happened before you patched), the dashboard decrypts that profile's own `sessionKey` cookie itself, read-only, and saves the same file the reporter would. A key that changed because you signed in again is picked up the same way.
 
 ---
 
@@ -137,6 +139,8 @@ State lives in `%USERPROFILE%\.claude-deck\` with the same layout as macOS (`bac
 ## App updates remove the patch
 
 Your logins, profiles, and chat history all survive Claude updates: they live outside the app bundle, in `~/Library/Application Support/Claude Profiles/` and `~/.claude`. Only the patch itself is overwritten, because Claude's auto-updater replaces `app.asar` wholesale.
+
+Most things keep working while the patch is gone: profiles still launch separately, and the dashboard still shows usage (it reads the cookies itself). What you lose until you re-apply is the `[profile]` window title.
 
 Fix it with either:
 
