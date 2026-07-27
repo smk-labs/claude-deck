@@ -27,15 +27,26 @@ if (!transferFile || !fs.existsSync(transferFile)) {
   process.exit(1);
 }
 const data = JSON.parse(fs.readFileSync(transferFile, 'utf8'));
-const APPDATA = process.env.APPDATA;
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+// Data dirs live outside the MSIX-virtualized known folders at
+// ~\ClaudeProfiles\<name>; fall back to the legacy AppData layout on machines
+// that have not run the one-time migration yet. Same resolve-order as
+// claude-deck.ps1 and server.js.
+const ESCAPED_ROOT = path.join(process.env.USERPROFILE || '', 'ClaudeProfiles');
+const LEGACY_ROOT = path.join(process.env.APPDATA || '', 'Claude Profiles');
+function profileDir(name) {
+  const escaped = path.join(ESCAPED_ROOT, name);
+  if (fs.existsSync(escaped)) return escaped;
+  return path.join(LEGACY_ROOT, name);
+}
 
 for (const name of Object.keys(data)) {
   if (name === '(default)') continue;             // never overwrite the working default
   if (only && name !== only) continue;
   const macAccount = data[name].account;
   const macCache = data[name].cache;
-  const ud = path.join(APPDATA, 'Claude Profiles', name);
+  const ud = profileDir(name);
   const cfgP = path.join(ud, 'config.json');
   const lsP = path.join(ud, 'Local State');
   const ckP = path.join(ud, 'Network', 'Cookies');
