@@ -191,17 +191,102 @@ function seedOrg(cookiesDb, orgUuid) {
   return { ok: true };
 }
 
-module.exports = { seedOrg, decryptV10, encryptV10, deriveKey, UUID_RE };
+// ---- session seeding (Windows only) ----
+
+// Plants a profile JSON's sessionKey as the claude.ai cookie, so a migrated
+// profile opens logged in without a login. On macOS the injected code already
+// does this at app.whenReady(); on Windows MSIX there is no injection at all,
+// so nothing else can. Windows-only for exactly that reason.
+//
+// Unlike seedOrg there IS no existing row to copy leading bytes from, but the
+// Windows format is fully known: plaintext = SHA-256(host_key) + value,
+// verified live against a real profile. The rest of the sqlite row is cloned
+// from one of the profile's own claude.ai cookies, so the column set always
+// matches whatever Chromium schema that profile is on.
+//
+// Caller MUST guarantee the profile is not running (same reason as seedOrg).
+//
+// Returns { ok:true, hosts:[...] } or { ok:false, reason: 'win-only' |
+// 'no-sqlite' | 'bad-key' | 'no-template' }.
+const SESSION_HOSTS = ['claude.ai', '.claude.ai'];
+const SESSION_TTL_DAYS = 60;
+const CHROME_EPOCH_OFFSET_MS = 11644473600000; // 1601-01-01 -> 1970-01-01
+
+// Chromium stores these as microseconds since 1601, which overflows a JS
+// number, so they are read and written as BigInt throughout.
+function toChromeTime(ms) {
+  return BigInt(ms + CHROME_EPOCH_OFFSET_MS) * 1000n;
+}
+
+function seedSession(cookiesDb, sessionKey) {
+  if (!IS_WIN) return { ok: false, reason: 'win-only' };
+  if (!sessionKey || !/^sk-ant-sid\S+$/.test(sessionKey)) return { ok: false, reason: 'bad-key' };
+
+  const sqlite = getNodeSqlite();
+  if (!sqlite) return { ok: false, reason: 'no-sqlite' };
+
+  const db = new sqlite.DatabaseSync(cookiesDb);
+  try {
+    // A row of the profile's own, purely as a column-shape template.
+    const templateStmt = db.prepare("SELECT * FROM cookies WHERE host_key LIKE '%claude.ai' LIMIT 1");
+    templateStmt.setReadBigInts(true);
+    const template = templateStmt.get();
+    if (!template) return { ok: false, reason: 'no-template' };
+
+    const key = deriveKey(cookiesDb);
+    const nowMs = Date.now();
+    const expires = toChromeTime(nowMs + SESSION_TTL_DAYS * 86400000);
+    const del = db.prepare('DELETE FROM cookies WHERE host_key = ? AND name = ?');
+
+    SESSION_HOSTS.forEach((host, i) => {
+      const plain = Buffer.concat([
+        crypto.createHash('sha256').update(host).digest(),
+        Buffer.from(sessionKey, 'utf8'),
+      ]);
+      const overrides = {
+        creation_utc: toChromeTime(nowMs) + BigInt(i), // part of the primary key
+        host_key: host,
+        name: 'sessionKey',
+        value: '',
+        encrypted_value: encryptV10(key, plain),
+        path: '/',
+        expires_utc: expires,
+        is_secure: 1,
+        is_httponly: 1,
+        last_access_utc: toChromeTime(nowMs),
+        has_expires: 1,
+        is_persistent: 1,
+        samesite: 1, // lax
+        source_scheme: 2, // secure
+        source_port: 443,
+        last_update_utc: toChromeTime(nowMs),
+      };
+      // Unknown / future columns keep the template's own value.
+      const cols = Object.keys(template);
+      const row = cols.map((c) => (c in overrides ? overrides[c] : template[c]));
+      del.run(host, 'sessionKey');
+      db.prepare(
+        'INSERT INTO cookies (' + cols.join(',') + ') VALUES (' + cols.map(() => '?').join(',') + ')'
+      ).run(...row);
+    });
+  } finally {
+    db.close();
+  }
+  return { ok: true, hosts: SESSION_HOSTS };
+}
+
+module.exports = { seedOrg, seedSession, decryptV10, encryptV10, deriveKey, UUID_RE };
 
 if (require.main === module) {
-  const [, , cmd, cookiesDb, orgUuid] = process.argv;
-  if (cmd !== 'seed-org' || !cookiesDb || !orgUuid) {
+  const [, , cmd, cookiesDb, arg] = process.argv;
+  if ((cmd !== 'seed-org' && cmd !== 'seed-session') || !cookiesDb || !arg) {
     console.error('usage: node cookie-crypto.js seed-org <cookiesDbPath> <orgUuid>');
+    console.error('       node cookie-crypto.js seed-session <cookiesDbPath> <sessionKey>');
     process.exit(1);
   }
   let result;
   try {
-    result = seedOrg(cookiesDb, orgUuid);
+    result = cmd === 'seed-org' ? seedOrg(cookiesDb, arg) : seedSession(cookiesDb, arg);
   } catch (e) {
     console.error(String((e && e.message) || e));
     process.exit(1);
