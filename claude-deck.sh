@@ -21,6 +21,7 @@
 #   ./claude-deck.sh dash [port]       # run the local usage dashboard
 #   ./claude-deck.sh stop [port]       # (alias: kill) stop the dashboard + quit every open profile
 #   ./claude-deck.sh doctor            # repair session-index links, check patch freshness
+#   ./claude-deck.sh dedupe            # share the CLI/VM SDK downloads across profiles
 #   ./claude-deck.sh install           # copy to ~/.claude-deck/bin + zsh alias
 #   ./claude-deck.sh uninstall         # remove the alias only
 #   ./claude-deck.sh watchdog on|off   # (sudo) auto re-patch after app updates
@@ -110,7 +111,12 @@ PROFILES_DIR="$STATE_DIR/profiles"
 MARKER="claude-deck.js"      # presence in asar means "patched"
 OTHER_MARKER="rtl-fix.js"    # marker used by the sibling claude-rtl patch
 PROFILES_USERDATA_ROOT="$HOME/Library/Application Support/Claude Profiles"
-SHARED_SESSIONS_DIR="$HOME/Library/Application Support/Claude/claude-code-sessions"
+# The default (flag-less) instance's userData dir. It is the single source
+# every profile borrows from: the session index, the downloaded Claude Code
+# CLI and Cowork VM SDK, and the Cowork VM disk all live here.
+SHARED_ARTIFACT_ROOT="$HOME/Library/Application Support/Claude"
+SHARED_SESSIONS_DIR="$SHARED_ARTIFACT_ROOT/claude-code-sessions"
+VM_CLONE_STATE_DIR="$STATE_DIR/vm-clones"
 
 # Watchdog (root-owned copy + LaunchDaemon).
 WD_LABEL="com.smklabs.claude-deck"
@@ -1400,6 +1406,451 @@ ensure_profile_index_link() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# artifact sharing (claude-code / claude-code-vm version dirs, Cowork VM disk)
+# ---------------------------------------------------------------------------
+
+# Claude Desktop downloads its own private copy of the Claude Code CLI
+# (claude-code/<version>, ~246MB) and of the Cowork VM SDK (claude-code-vm/
+# <version>, ~245MB) into whatever userData dir it is pointed at, so N
+# profiles meant N byte-identical copies of the same binaries. These helpers
+# point each profile's version dir at the default instance's copy instead,
+# reusing the migrate-then-link shape of ensure_profile_index_link above.
+#
+# Linked at the VERSION level, never at the parent: the app writes a
+# .verified marker inside each <version>/ and ships an update by dropping in
+# a whole new <version>/ directory. A shared claude-code/ parent would let
+# one profile's update rewrite every other profile's view of it; a shared
+# claude-code/<version>/ cannot, because that directory never changes once
+# verified. A new version simply lands per-profile and gets linked on the
+# next `doctor` (or `dedupe`) run.
+ARTIFACT_KINDS="claude-code claude-code-vm"
+VM_BUNDLE_REL="vm_bundles/claudevm.bundle"
+
+# Relative path, inside a <kind>/<version>/ dir, of the binary whose sha256
+# decides "these two copies are the same". Everything else in there is either
+# derived from it or a marker file.
+_artifact_probe_rel() {
+  case "$1" in
+    claude-code)    printf 'claude.app/Contents/MacOS/claude\n' ;;
+    claude-code-vm) printf 'claude\n' ;;
+    *)              return 1 ;;
+  esac
+}
+
+_artifact_hash() {
+  local vdir="$1" kind="$2" rel
+  rel="$(_artifact_probe_rel "$kind")" || return 1
+  [ -f "$vdir/$rel" ] || return 1
+  shasum -a 256 "$vdir/$rel" 2>/dev/null | awk '{print $1}'
+}
+
+# Stricter than _profile_is_running: also true when any process is executing
+# a binary out of THIS profile's claude-code tree, because the Claude Code
+# CLI outlives the window that spawned it. Moving or deleting a version dir
+# out from under a live process is the one real hazard in here, so every
+# artifact helper gates on this rather than on the window being open.
+_profile_artifacts_in_use() {
+  local name="$1"
+  if _profile_is_running "$name"; then
+    return 0
+  fi
+  ps ax -o command 2>/dev/null \
+    | grep -F "Claude Profiles/$name/claude-code" \
+    | grep -v grep >/dev/null 2>&1
+}
+
+# Trailing `|| true` matters: `set -o pipefail` is on, and du exits non-zero
+# on any unreadable subdirectory while still printing a usable total, which
+# would otherwise make the enclosing `x="$(_du_kb ...)"` assignment trip -e.
+_du_kb() { du -sk "$1" 2>/dev/null | awk '{print $1}' || true; }
+
+_kb_human() {
+  awk -v k="${1:-0}" 'BEGIN{
+    if (k >= 1048576) printf "%.1fG", k/1048576;
+    else if (k >= 1024) printf "%.0fM", k/1024;
+    else printf "%dK", k;
+  }'
+}
+
+# Links one profile's version dirs at the shared root's copies.
+#
+#   name  profile name
+#   dry   "yes" = print what would happen, touch nothing
+#   mode  "seed" = only create missing links and drop dangling ones (cheap,
+#                  safe to run on every launch)
+#         "full" = also replace a profile's own real version dir with a link
+#                  once its probe binary hashes identical (~1s per hash)
+#
+# Reclaimed kilobytes are appended to $_ARTIFACT_RECLAIM_FILE when set, since
+# the callers run this inside a `while read` subshell where a counter
+# variable would not survive.
+_relink_profile_artifacts() {
+  local name="$1" dry="${2:-no}" mode="${3:-full}"
+  local profile_dir kind vdir sdir version target tmp h_prof h_def kb
+  profile_dir="$PROFILES_USERDATA_ROOT/$name"
+  [ -d "$profile_dir" ] || return 0
+
+  if _profile_artifacts_in_use "$name"; then
+    printf "  %-14s %-28s %s\n" "$name" "-" "skipped-running"
+    return 0
+  fi
+
+  for kind in $ARTIFACT_KINDS; do
+    # 1) The profile's own entries.
+    if [ -d "$profile_dir/$kind" ]; then
+      for vdir in "$profile_dir/$kind"/*; do
+        [ -e "$vdir" ] || [ -L "$vdir" ] || continue
+        version="$(basename "$vdir")"
+        case "$version" in .*) continue ;; esac
+        target="$SHARED_ARTIFACT_ROOT/$kind/$version"
+
+        if [ -L "$vdir" ]; then
+          [ -e "$vdir" ] && continue
+          # Dangling: the shared copy was removed (the app garbage-collects
+          # old versions). Drop the link so the app can download afresh.
+          if [ "$dry" = "yes" ]; then
+            printf "  %-14s %-28s would-drop-dangling-link\n" "$name" "$kind/$version"
+          else
+            rm -f "$vdir" 2>/dev/null || true
+            printf "  %-14s %-28s dropped-dangling-link\n" "$name" "$kind/$version"
+          fi
+          continue
+        fi
+
+        [ -d "$vdir" ] || continue
+
+        if [ ! -d "$target" ]; then
+          # The default instance never downloaded this version. Promote this
+          # profile's copy into the shared root and link back to it, so the
+          # next profile that wants it links instead of downloading.
+          if [ "$mode" != "full" ]; then continue; fi
+          if [ "$dry" = "yes" ]; then
+            printf "  %-14s %-28s would-promote-to-shared\n" "$name" "$kind/$version"
+            continue
+          fi
+          mkdir -p "$SHARED_ARTIFACT_ROOT/$kind" 2>/dev/null || true
+          if mv "$vdir" "$target" 2>/dev/null && ln -s "$target" "$vdir" 2>/dev/null; then
+            printf "  %-14s %-28s promoted-to-shared + linked\n" "$name" "$kind/$version"
+          else
+            # Put it back rather than leave the profile without the version.
+            [ -e "$vdir" ] || mv "$target" "$vdir" 2>/dev/null || true
+            printf "  %-14s %-28s promote-failed (left as-is)\n" "$name" "$kind/$version"
+          fi
+          continue
+        fi
+
+        if [ "$mode" != "full" ]; then continue; fi
+
+        h_prof="$(_artifact_hash "$vdir" "$kind" 2>/dev/null || true)"
+        h_def="$(_artifact_hash "$target" "$kind" 2>/dev/null || true)"
+        if [ -z "$h_prof" ] || [ -z "$h_def" ]; then
+          printf "  %-14s %-28s kept (probe binary missing: cannot verify)\n" "$name" "$kind/$version"
+          continue
+        fi
+        if [ "$h_prof" != "$h_def" ]; then
+          printf "  %-14s %-28s kept (differs from shared copy)\n" "$name" "$kind/$version"
+          continue
+        fi
+
+        kb="$(_du_kb "$vdir")"
+        if [ "$dry" = "yes" ]; then
+          printf "  %-14s %-28s would-link (frees %s)\n" "$name" "$kind/$version" "$(_kb_human "${kb:-0}")"
+          continue
+        fi
+        # Rename-then-link-then-delete: at no point is the profile left
+        # without either the real dir or a working link.
+        tmp="$vdir.replacing-$$"
+        if mv "$vdir" "$tmp" 2>/dev/null && ln -s "$target" "$vdir" 2>/dev/null; then
+          rm -rf "$tmp" 2>/dev/null || true
+          [ -n "${_ARTIFACT_RECLAIM_FILE:-}" ] && printf '%s\n' "${kb:-0}" >> "$_ARTIFACT_RECLAIM_FILE"
+          printf "  %-14s %-28s linked (freed %s)\n" "$name" "$kind/$version" "$(_kb_human "${kb:-0}")"
+        else
+          [ -e "$vdir" ] || mv "$tmp" "$vdir" 2>/dev/null || true
+          printf "  %-14s %-28s link-failed (left as-is)\n" "$name" "$kind/$version"
+        fi
+      done
+    fi
+
+    # 2) Pre-seed: link every version the shared root already has and this
+    #    profile lacks. This is what stops a brand-new profile from
+    #    downloading its own copy on its very first launch.
+    [ -d "$SHARED_ARTIFACT_ROOT/$kind" ] || continue
+    for sdir in "$SHARED_ARTIFACT_ROOT/$kind"/*; do
+      [ -d "$sdir" ] || continue
+      [ -L "$sdir" ] && continue
+      version="$(basename "$sdir")"
+      case "$version" in .*) continue ;; esac
+      vdir="$profile_dir/$kind/$version"
+      if [ -e "$vdir" ] || [ -L "$vdir" ]; then continue; fi
+      if [ "$dry" = "yes" ]; then
+        printf "  %-14s %-28s would-seed-link\n" "$name" "$kind/$version"
+        continue
+      fi
+      mkdir -p "$profile_dir/$kind" 2>/dev/null || true
+      if ln -s "$sdir" "$vdir" 2>/dev/null; then
+        printf "  %-14s %-28s seeded-link\n" "$name" "$kind/$version"
+      fi
+    done
+  done
+  return 0
+}
+
+# Cowork's VM disk (rootfs.img) is a 10GB sparse file, ~5.2GB on disk, and
+# every profile that opens Cowork downloads its own. It is the ONLY shareable
+# file in the bundle: everything beside it (sessiondata.img, efivars.fd,
+# vmIP, machineIdentifier, macAddress, gvisorMacAddress, .cowork-adopted) is
+# mutable per-VM state, so the bundle itself must never be symlinked. Instead
+# APFS-clone just the disk: instant, zero blocks until written, and each VM
+# still diverges into its own copy-on-write pages.
+#
+# The app treats a bundle as ready when rootfs.img and .rootfs.img.origin are
+# both there, so seeding exactly those two is what keeps a first Cowork
+# launch from re-downloading. Never overwrites an existing disk.
+#
+# By default this only fills in a bundle the app has ALREADY created (i.e. a
+# profile where Cowork was opened at least once, which is the profile that
+# was about to download 1.2GB). `--seed-vm-all` passes create="yes" to also
+# pre-create the bundle in profiles that have never touched Cowork, so their
+# first launch is covered too; that is opt-in because it puts a 10GB-apparent
+# (0-byte) file in every profile and makes plain `du` look alarming.
+_seed_profile_vm_rootfs() {
+  local name="$1" dry="${2:-no}" create="${3:-no}"
+  local src_bundle dst_bundle src_img src_org origin
+  src_bundle="$SHARED_ARTIFACT_ROOT/$VM_BUNDLE_REL"
+  dst_bundle="$PROFILES_USERDATA_ROOT/$name/$VM_BUNDLE_REL"
+  src_img="$src_bundle/rootfs.img"
+  src_org="$src_bundle/.rootfs.img.origin"
+
+  [ -d "$PROFILES_USERDATA_ROOT/$name" ] || return 0
+  [ -f "$src_img" ] || return 0
+  [ -f "$src_org" ] || return 0
+  if [ ! -d "$dst_bundle" ] && [ "$create" != "yes" ]; then return 0; fi
+  if [ -e "$dst_bundle/rootfs.img" ]; then return 0; fi
+  if _profile_artifacts_in_use "$name"; then return 0; fi
+
+  if [ "$dry" = "yes" ]; then
+    printf "  %-14s %-28s would-clone-from-default\n" "$name" "vm rootfs.img"
+    return 0
+  fi
+
+  mkdir -p "$dst_bundle" 2>/dev/null || true
+  if cp -c "$src_img" "$dst_bundle/rootfs.img" 2>/dev/null; then
+    cp "$src_org" "$dst_bundle/.rootfs.img.origin" 2>/dev/null || true
+    origin="$(cat "$src_org" 2>/dev/null || echo unknown)"
+    mkdir -p "$VM_CLONE_STATE_DIR" 2>/dev/null || true
+    printf 'origin=%s\nclonedAt=%s\n' "$origin" "$(date +%s)" \
+      > "$VM_CLONE_STATE_DIR/$name" 2>/dev/null || true
+    printf "  %-14s %-28s cloned from default (0 bytes until written)\n" "$name" "vm rootfs.img"
+  else
+    rm -f "$dst_bundle/rootfs.img" 2>/dev/null || true
+    printf "  %-14s %-28s clone-failed (Cowork will download its own)\n" "$name" "vm rootfs.img"
+  fi
+  return 0
+}
+
+# Opt-in only (`dedupe --convert-vm`). Replaces a profile's own full-copy
+# rootfs.img with a clone of the default instance's disk. That reclaims ~5GB
+# per profile but DISCARDS everything that VM ever wrote to its root disk
+# (installed packages, anything outside sessiondata.img), which is why it is
+# never automatic and never runs on a live profile.
+_convert_profile_vm_to_clone() {
+  local name="$1" dry="${2:-no}"
+  local src_bundle dst_bundle src_img dst_img src_origin dst_origin kb tmp
+  src_bundle="$SHARED_ARTIFACT_ROOT/$VM_BUNDLE_REL"
+  dst_bundle="$PROFILES_USERDATA_ROOT/$name/$VM_BUNDLE_REL"
+  src_img="$src_bundle/rootfs.img"
+  dst_img="$dst_bundle/rootfs.img"
+
+  [ -f "$src_img" ] || return 0
+  [ -f "$dst_img" ] || return 0
+  [ -L "$dst_img" ] && return 0
+  if [ -f "$VM_CLONE_STATE_DIR/$name" ]; then
+    printf "  %-14s %-28s already a clone\n" "$name" "vm rootfs.img"
+    return 0
+  fi
+  if _profile_artifacts_in_use "$name"; then
+    printf "  %-14s %-28s skipped-running\n" "$name" "vm rootfs.img"
+    return 0
+  fi
+
+  src_origin="$(cat "$src_bundle/.rootfs.img.origin" 2>/dev/null || echo '')"
+  dst_origin="$(cat "$dst_bundle/.rootfs.img.origin" 2>/dev/null || echo '')"
+  if [ -z "$src_origin" ] || [ "$src_origin" != "$dst_origin" ]; then
+    printf "  %-14s %-28s kept (origin differs from default: not interchangeable)\n" "$name" "vm rootfs.img"
+    return 0
+  fi
+
+  kb="$(_du_kb "$dst_img")"
+  if [ "$dry" = "yes" ]; then
+    printf "  %-14s %-28s would-convert-to-clone (frees %s, discards this VM's disk state)\n" \
+      "$name" "vm rootfs.img" "$(_kb_human "${kb:-0}")"
+    return 0
+  fi
+
+  tmp="$dst_img.replacing-$$"
+  if mv "$dst_img" "$tmp" 2>/dev/null && cp -c "$src_img" "$dst_img" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    mkdir -p "$VM_CLONE_STATE_DIR" 2>/dev/null || true
+    printf 'origin=%s\nclonedAt=%s\nconverted=1\n' "$src_origin" "$(date +%s)" \
+      > "$VM_CLONE_STATE_DIR/$name" 2>/dev/null || true
+    [ -n "${_ARTIFACT_RECLAIM_FILE:-}" ] && printf '%s\n' "${kb:-0}" >> "$_ARTIFACT_RECLAIM_FILE"
+    printf "  %-14s %-28s converted to clone (freed %s)\n" "$name" "vm rootfs.img" "$(_kb_human "${kb:-0}")"
+  else
+    [ -e "$dst_img" ] || mv "$tmp" "$dst_img" 2>/dev/null || true
+    printf "  %-14s %-28s convert-failed (left as-is)\n" "$name" "vm rootfs.img"
+  fi
+  return 0
+}
+
+# Runs the artifact pass over every named profile. Same subshell caveat as
+# _repair_all_profiles: the loop body runs in a pipeline, so totals travel
+# through $_ARTIFACT_RECLAIM_FILE rather than a variable.
+_repair_all_artifacts() {
+  local dry="${1:-no}" mode="${2:-full}" convert="${3:-no}" seed_all="${4:-no}"
+  local names
+  names="$(_list_named_profiles)"
+  [ -n "$names" ] || return 0
+  # The loop body must end on a success, or the whole pipeline exits non-zero
+  # and `set -e` kills the script before the caller ever sees its report.
+  printf '%s\n' "$names" | while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    _relink_profile_artifacts "$name" "$dry" "$mode"
+    _seed_profile_vm_rootfs "$name" "$dry" "$seed_all"
+    if [ "$convert" = "yes" ]; then
+      _convert_profile_vm_to_clone "$name" "$dry"
+    fi
+    true
+  done
+  return 0
+}
+
+# Read-only inventory. This is the regression detector: a profile that has
+# quietly re-downloaded its own copy shows up as `dir` instead of `link`,
+# and a dangling link shows up as `DANGLING`, without anyone having to run a
+# du sweep by hand. Sizes come from du, which does NOT follow symlinks, so a
+# linked version dir correctly costs ~0 here. An APFS-cloned rootfs.img is
+# the one exception: du bills every clone the full size even though the
+# blocks are shared, which is exactly why the clone/copy column exists.
+_artifact_report_one() {
+  local name="$1" root="$2"
+  local kind vdir version total state note img img_kb origin is_clone
+  img="$root/$VM_BUNDLE_REL/rootfs.img"
+  img_kb=0
+  is_clone="no"
+  if [ -e "$img" ]; then
+    img_kb="$(_du_kb "$img")"
+    [ -f "$VM_CLONE_STATE_DIR/$name" ] && is_clone="yes"
+  fi
+  total="$(_du_kb "$root")"
+  # du bills an APFS clone the full file size even though its blocks are
+  # shared with the default's disk, so a cloned rootfs is taken out of the
+  # profile total and shown on its own line instead. Anything else would
+  # report ~5GB of disk that does not exist.
+  if [ "$is_clone" = "yes" ]; then
+    total=$(( ${total:-0} - ${img_kb:-0} ))
+    [ "$total" -lt 0 ] && total=0
+    printf "  %-14s total %s (+ cloned VM disk, shares blocks with default)\n" \
+      "$name" "$(_kb_human "$total")"
+  else
+    printf "  %-14s total %s\n" "$name" "$(_kb_human "${total:-0}")"
+  fi
+
+  for kind in $ARTIFACT_KINDS; do
+    [ -d "$root/$kind" ] || continue
+    for vdir in "$root/$kind"/*; do
+      [ -e "$vdir" ] || [ -L "$vdir" ] || continue
+      version="$(basename "$vdir")"
+      case "$version" in .*) continue ;; esac
+      if [ -L "$vdir" ]; then
+        if [ -e "$vdir" ]; then
+          state="link"; note="-> shared"
+        else
+          state="DANGLING"; note="-> $(readlink "$vdir" 2>/dev/null)"
+        fi
+      elif [ -d "$vdir" ]; then
+        state="dir"; note="$(_kb_human "$(_du_kb "$vdir")")"
+      else
+        continue
+      fi
+      printf "    %-28s %-9s %s\n" "$kind/$version" "$state" "$note"
+    done
+  done
+
+  if [ -e "$img" ]; then
+    state="full-copy"
+    [ "$is_clone" = "yes" ] && state="clone"
+    origin="?"
+    if [ -f "$root/$VM_BUNDLE_REL/.rootfs.img.origin" ]; then
+      origin="$(cut -c1-12 "$root/$VM_BUNDLE_REL/.rootfs.img.origin" 2>/dev/null || echo '?')"
+    fi
+    printf "    %-28s %-9s %s  origin %s\n" "vm_bundles rootfs.img" "$state" \
+      "$(_kb_human "${img_kb:-0}")" "$origin"
+  fi
+  return 0
+}
+
+_artifact_report() {
+  printf "\n"
+  c_dim "Shared-artifact inventory (source: $SHARED_ARTIFACT_ROOT)"
+  _artifact_report_one "default" "$SHARED_ARTIFACT_ROOT"
+  _list_named_profiles | while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    _artifact_report_one "$name" "$PROFILES_USERDATA_ROOT/$name"
+    true
+  done
+  return 0
+}
+
+cmd_dedupe() {
+  local dry="no" convert="no" report_only="no" seed_all="no" arg total
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run)      dry="yes" ;;
+      --convert-vm)   convert="yes" ;;
+      --seed-vm-all)  seed_all="yes" ;;
+      --report)       report_only="yes" ;;
+      *)              die "Unknown option for dedupe: $arg (see: $0 --help)" ;;
+    esac
+  done
+
+  if [ "$report_only" = "yes" ]; then
+    _artifact_report
+    return 0
+  fi
+
+  if [ "$convert" = "yes" ] && [ "$dry" != "yes" ]; then
+    c_yellow "--convert-vm replaces each profile's own Cowork VM disk with a clone of the"
+    c_yellow "default instance's disk. That frees ~5GB per profile but DISCARDS whatever"
+    c_yellow "that VM installed on its root disk. Sessions (sessiondata.img) are untouched."
+    printf "Type 'yes' to continue: "
+    local reply=""
+    read -r reply || true
+    [ "$reply" = "yes" ] || die "Aborted: nothing was changed."
+  fi
+
+  _ARTIFACT_RECLAIM_FILE="$(mktemp)"
+  export _ARTIFACT_RECLAIM_FILE
+
+  if [ "$dry" = "yes" ]; then
+    step "Dry run: nothing will be changed."
+  fi
+  step "Sharing Claude Code / VM SDK downloads across profiles..."
+  _repair_all_artifacts "$dry" full "$convert" "$seed_all"
+
+  total="$(awk '{s+=$1} END {printf "%d", s+0}' "$_ARTIFACT_RECLAIM_FILE" 2>/dev/null || echo 0)"
+  rm -f "$_ARTIFACT_RECLAIM_FILE"
+  unset _ARTIFACT_RECLAIM_FILE
+
+  _artifact_report
+  printf "\n"
+  if [ "$dry" = "yes" ]; then
+    c_dim "Dry run: re-run without --dry-run to apply."
+  else
+    c_green "✓ Reclaimed $(_kb_human "$total")."
+  fi
+}
+
 cmd_open() {
   local name="${1:-}"
   local org_uuid="${2:-}"
@@ -1425,6 +1876,13 @@ cmd_open() {
 
   _validate_profile_name "$name"
   ensure_profile_index_link "$name" || true
+  # "seed" mode only: create the links this profile is missing and drop dead
+  # ones. That is pure symlink work (milliseconds) and is what stops a brand
+  # new profile from downloading its own ~246MB copy of the Claude Code CLI.
+  # The hash-verify-and-replace pass costs ~1s per version dir, so it stays
+  # in `dedupe`/`doctor` rather than on the launch path.
+  _relink_profile_artifacts "$name" no seed >/dev/null 2>&1 || true
+  _seed_profile_vm_rootfs "$name" no no >/dev/null 2>&1 || true
 
   if _profile_is_running "$name"; then
     step "Profile '$name' already running: focusing its window..."
@@ -1651,6 +2109,21 @@ _doctor_check_injection_freshness() {
 cmd_doctor() {
   step "Repairing session-index links for every named profile..."
   _repair_all_profiles verbose
+
+  # Relinks version dirs a profile downloaded on its own since the last run
+  # (every Claude Code update lands one per profile). Never converts an
+  # existing VM disk: that is `dedupe --convert-vm`, opt-in only.
+  step "Sharing Claude Code / VM SDK downloads across profiles..."
+  _ARTIFACT_RECLAIM_FILE="$(mktemp)"
+  export _ARTIFACT_RECLAIM_FILE
+  _repair_all_artifacts no full no no
+  local _reclaimed
+  _reclaimed="$(awk '{s+=$1} END {printf "%d", s+0}' "$_ARTIFACT_RECLAIM_FILE" 2>/dev/null || echo 0)"
+  rm -f "$_ARTIFACT_RECLAIM_FILE"
+  unset _ARTIFACT_RECLAIM_FILE
+  [ "${_reclaimed:-0}" -gt 0 ] && c_green "  reclaimed $(_kb_human "$_reclaimed")"
+
+  _artifact_report
 
   step "Checking installed patch freshness..."
   _doctor_check_injection_freshness
@@ -1905,8 +2378,26 @@ Usage:
                          profile including default. The dashboard server
                          has no tie to Claude.app at all: quitting Claude
                          windows never stops it on its own.
-  $0 doctor              repair every profile's session-index link, check
-                         patch freshness, run claude-sync if idle
+  $0 doctor              repair every profile's session-index link, share any
+                         newly-downloaded CLI/VM SDK copies, print the
+                         shared-artifact inventory, check patch freshness,
+                         run claude-sync if idle
+  $0 dedupe [--dry-run] [--report] [--convert-vm] [--seed-vm-all]
+                         stop every profile from keeping its own copy of the
+                         Claude Code CLI and Cowork VM SDK (~246MB each):
+                         point each profile's <version> dir at the default
+                         instance's copy once their binaries hash identical.
+                         --dry-run     print what would change, touch nothing
+                         --report      inventory only, change nothing
+                         --convert-vm  ALSO replace each profile's own Cowork
+                                       VM disk with a clone of the default's.
+                                       Frees ~5GB per profile but DISCARDS
+                                       what that VM wrote to its root disk
+                                       (sessions are untouched). Asks first.
+                         --seed-vm-all pre-clone the VM disk into profiles
+                                       that never opened Cowork too (free:
+                                       an APFS clone costs 0 bytes until
+                                       written, but plain du will show it)
   $0 install             add 'claude-deck' shortcut to ~/.zshrc
   $0 uninstall           remove the 'claude-deck' shortcut from ~/.zshrc
   $0 watchdog on|off     (sudo) auto re-patch after Claude updates
@@ -1939,6 +2430,7 @@ case "$SUBCOMMAND" in
   dash)           cmd_dash "$@" ;;
   stop|kill)      cmd_stop "$@" ;;
   doctor)         cmd_doctor ;;
+  dedupe)         cmd_dedupe "$@" ;;
   install)        cmd_install ;;
   uninstall)      cmd_uninstall ;;
   watchdog)       cmd_watchdog "$@" ;;
