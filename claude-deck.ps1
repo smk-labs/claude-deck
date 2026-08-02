@@ -408,6 +408,86 @@ function Profile-Running($name) {
   return [bool]($procs | Where-Object { $_.CommandLine -match $rx })
 }
 
+# SSH connections ("Add SSH connection" in the app) are stored per userData at
+# <profile>\ssh_configs.json, so a connection added under one profile is
+# invisible under every other one. Every profile shares ~/.claude already, and
+# a remote box you can reach is a property of the machine, not of the account,
+# so this file should be shared too.
+#
+# Merge, don't link: the app rewrites this file wholesale, which would break a
+# hardlink and silently fork the profiles again. Instead we union every
+# profile's file at launch and write the union back. Whatever a profile added
+# last session propagates to the rest on the next launch, from either
+# direction, with no daemon.
+#
+# Tradeoff, deliberate: union means a deleted connection comes back as long as
+# any other profile still lists it. Removing one for good means removing it
+# from each profile, or deleting the entry from every ssh_configs.json at once.
+#
+# Running profiles are skipped as write targets: the live app owns its copy in
+# memory and would overwrite us on quit. They still contribute their entries.
+# Never fatal: any failure here just means profiles stay unsynced.
+function Sync-SshConfigs($launching) {
+  try {
+    if (-not (Test-Path -LiteralPath $ProfilesUserDataRoot)) { return }
+
+    $dirs = @()
+    if ($DefaultUserDataDir -ne (Join-Path $ProfilesUserDataRoot 'default')) {
+      $dirs += ,@{ Name = 'default'; Dir = $DefaultUserDataDir }
+    }
+    foreach ($d in @(Get-ChildItem -LiteralPath $ProfilesUserDataRoot -Directory -ErrorAction SilentlyContinue)) {
+      $dirs += ,@{ Name = $d.Name; Dir = $d.FullName }
+    }
+    if ($dirs.Count -lt 2) { return }
+
+    # Union pass. Keyed by id when the app gave one, else by host+name, so the
+    # same connection saved separately under two profiles collapses to one.
+    $byKey = [ordered]@{}
+    $hosts = [ordered]@{}
+    foreach ($p in $dirs) {
+      $f = Join-Path $p.Dir 'ssh_configs.json'
+      if (-not (Test-Path -LiteralPath $f)) { continue }
+      $data = $null
+      try { $data = Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+      if (-not $data) { continue }
+      foreach ($c in @($data.configs)) {
+        if (-not $c) { continue }
+        $key = if ($c.id) { "id:$($c.id)" } else { "hn:$($c.sshHost)|$($c.name)" }
+        if (-not $byKey.Contains($key)) { $byKey[$key] = $c }
+      }
+      foreach ($h in @($data.trustedHosts)) {
+        if ($h -and -not $hosts.Contains($h)) { $hosts[$h] = $true }
+      }
+    }
+    if ($byKey.Count -eq 0) { return }
+
+    $merged = [pscustomobject]@{
+      configs      = @($byKey.Values)
+      trustedHosts = @($hosts.Keys)
+    }
+    $json = $merged | ConvertTo-Json -Depth 6
+
+    $wrote = 0
+    foreach ($p in $dirs) {
+      if ($p.Name -ne $launching -and (Profile-Running $p.Name)) { continue }
+      $f = Join-Path $p.Dir 'ssh_configs.json'
+      $old = $null
+      if (Test-Path -LiteralPath $f) {
+        try { $old = Get-Content -LiteralPath $f -Raw -Encoding UTF8 } catch {}
+      }
+      if ($old -and ($old.Trim() -eq $json.Trim())) { continue }
+      try {
+        New-Item -ItemType Directory -Force -Path $p.Dir | Out-Null
+        Set-Content -LiteralPath $f -Value $json -Encoding UTF8
+        $wrote++
+      } catch {}
+    }
+    if ($wrote -gt 0) {
+      Note "  Synced $($byKey.Count) SSH connection(s) to $wrote profile(s)."
+    }
+  } catch {}
+}
+
 # Never kill Claude as a side effect of patching a --app scratch target: the
 # process match is name-based and would hit the real running app regardless
 # of which bundle is being patched. Only act on the real install.
@@ -1143,6 +1223,7 @@ function Start-ClaudeInstance($name) {
   if ($name -and $name -ne 'default') {
     $dir = Join-Path $ProfilesUserDataRoot $name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Sync-SshConfigs $name
     $env:CLAUDE_USER_DATA_DIR = $dir
     try {
       Start-Process -FilePath $Exe -ArgumentList "--profile=$name" -WorkingDirectory $AppDir
@@ -1153,6 +1234,7 @@ function Start-ClaudeInstance($name) {
     # Escaped root active: the default instance must also live outside the
     # virtualized AppData, or its writes keep landing in the MSIX overlay.
     New-Item -ItemType Directory -Force -Path $DefaultUserDataDir | Out-Null
+    Sync-SshConfigs 'default'
     $env:CLAUDE_USER_DATA_DIR = $DefaultUserDataDir
     try {
       Start-Process -FilePath $Exe -WorkingDirectory $AppDir
