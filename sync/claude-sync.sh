@@ -264,6 +264,8 @@ ensure_run_dir() {
 #   CHG<TAB>cfg<TAB>mcpAdded<TAB>mcpUpdated<TAB>mcpRemoved<TAB>prefsSet
 #   VOTE<TAB>name<TAB>cfg          (witness that justified each removal)
 #   STALE<TAB>cfg<TAB>names        (config ignored this run, names it lost)
+#   PSKIP<TAB>name<TAB>path        (every copy points at a missing file)
+#   PFIX<TAB>name<TAB>cfg<TAB>path (that cfg had a missing path, repaired)
 #   LEDGER<TAB>cfg<TAB>names       (post-write mcpServers set of that cfg)
 CONFIG_SYNC_JS='function run(argv) {
   ObjC.import("Foundation");
@@ -287,6 +289,37 @@ CONFIG_SYNC_JS='function run(argv) {
     var ks = Object.keys(v).sort(), o = [];
     for (var i = 0; i < ks.length; i++) o.push(JSON.stringify(ks[i]) + ":" + canon(v[ks[i]]));
     return "{" + o.join(",") + "}";
+  }
+  // An mcpServers entry that names a local absolute path is a CACHE of where
+  // a file sits on THIS machine, not per-profile state. The filesystem is the
+  // only authority for it. Profiles legitimately differ on identity (env,
+  // tokens, ${VAR} headers); they must never disagree about where a plugin
+  // server file lives, and a config must never win that argument against the
+  // disk. Behaviourally identical twin: Get-McpBrokenPaths in claude-sync.ps1
+  // and in claude-deck.ps1 / _mcp_broken_paths in claude-deck.sh. The one
+  // deliberate platform difference is PATHEXT, which the Windows twins apply
+  // to the command slot and macOS has no equivalent of.
+  function looksAbs(s) {
+    if (typeof s != "string" || !s) return false;
+    if (s.indexOf("${") >= 0 || s.indexOf("://") >= 0) return false;
+    return /^[A-Za-z]:[\\\/]/.test(s) || /^\\\\[^\\]/.test(s) || /^\/[^\/]/.test(s);
+  }
+  function onDisk(p) {
+    return $.NSFileManager.defaultManager.fileExistsAtPath($(p));
+  }
+  // Every local absolute path this definition points at that is NOT on disk.
+  // Empty = healthy, which includes "names no local path at all" (an
+  // npx-launched remote server is always healthy here).
+  function brokenPaths(d) {
+    var bad = [];
+    if (!d || typeof d != "object" || Array.isArray(d)) return bad;
+    if (looksAbs(d.command) && !onDisk(d.command)) bad.push(d.command);
+    if (d.args && d.args.length) {
+      for (var i = 0; i < d.args.length; i++) {
+        if (looksAbs(d.args[i]) && !onDisk(d.args[i])) bad.push(d.args[i]);
+      }
+    }
+    return bad;
   }
   var PREFS_NO_SYNC = { launchPreviewPersistedWorkspaces: 1, launchPreviewSessionScopedSessions: 1 };
 
@@ -349,12 +382,21 @@ CONFIG_SYNC_JS='function run(argv) {
   for (var i = 0; i < files.length; i++) emt.push(stale[i] ? -1 : mts[i]);
 
   // --- mcpServers: winner per name, and the removal witnesses -------------
-  var chosen = {}, chosenMt = {}, order = [];
+  // PATH HEALTH OUTRANKS RECENCY. A definition whose local absolute paths are
+  // all on disk beats one that is not, whatever the mtimes say. Without this a
+  // plugin that moves its server file leaves every config holding the old
+  // path; the one config a plugin hook repaired is a single vote among them
+  // and loses the moment any other config is touched, so the repair is undone
+  // on every run and the loop never ends.
+  var chosen = {}, chosenMt = {}, chosenOk = {}, brokenAt = {}, order = [];
   for (var i = 0; i < files.length; i++) {
     var m = (cfgs[i] && cfgs[i].mcpServers) || {};
     for (var k in m) {
-      if (!(k in chosen)) { chosen[k] = m[k]; chosenMt[k] = emt[i]; order.push(k); }
-      else if (emt[i] > chosenMt[k] && canon(m[k]) !== canon(chosen[k])) {
+      var bad = brokenPaths(m[k]), ok = (bad.length === 0);
+      if (!ok && !(k in brokenAt)) brokenAt[k] = bad[0];
+      if (!(k in chosen)) { chosen[k] = m[k]; chosenMt[k] = emt[i]; chosenOk[k] = ok; order.push(k); }
+      else if (ok && !chosenOk[k]) { chosen[k] = m[k]; chosenMt[k] = emt[i]; chosenOk[k] = true; }
+      else if (ok === chosenOk[k] && emt[i] > chosenMt[k] && canon(m[k]) !== canon(chosen[k])) {
         chosen[k] = m[k]; chosenMt[k] = emt[i];
       }
     }
@@ -408,14 +450,30 @@ CONFIG_SYNC_JS='function run(argv) {
   var out = [];
   for (var s = 0; s < staleRows.length; s++) out.push(staleRows[s]);
   for (var v = 0; v < votes.length; v++) out.push(votes[v]);
+  // One row per name whose every copy on this machine is unrunnable. Not an
+  // error and not a removal: the file may be a plugin reinstall away. It is
+  // simply never broadcast, so no config gets a path it cannot run.
+  for (var q = 0; q < order.length; q++) {
+    if (removed[order[q]] || chosenOk[order[q]]) continue;
+    out.push("PSKIP\t" + order[q] + "\t" + brokenAt[order[q]]);
+  }
   for (var i = 0; i < files.length; i++) {
     var m = (cfgs[i] && cfgs[i].mcpServers) || {};
     var add = [], upd = [], del = [], pset = [];
     for (var q = 0; q < order.length; q++) {
       var k = order[q];
       if (removed[k]) { if (k in m) { del.push(k); delete m[k]; } continue; }
+      // Nothing runnable to spread: neither added where it is missing nor
+      // written over a config own copy. Also the symmetric half of the guard,
+      // since this union pass IS the capture step: a broken path read out of
+      // one profile can never be frozen into the others.
+      if (!chosenOk[k]) continue;
       if (!(k in m)) { add.push(k); m[k] = chosen[k]; }
-      else if (canon(m[k]) !== canon(chosen[k])) { upd.push(k); m[k] = chosen[k]; }
+      else if (canon(m[k]) !== canon(chosen[k])) {
+        var mine = brokenPaths(m[k]);
+        if (mine.length) out.push("PFIX\t" + k + "\t" + files[i] + "\t" + mine[0]);
+        upd.push(k); m[k] = chosen[k];
+      }
     }
     var p = cfgs[i].preferences;
     var pIsObj = (p !== null && typeof p == "object" && !Array.isArray(p));
@@ -499,6 +557,25 @@ sync_configs() {
           echo "  ${DIM}removal witness:${RESET} [$cfg] was in $add before and is gone there now"
         else
           log "  MCP removal witness: [$cfg] was recorded in $add and is gone there now"
+        fi
+        continue
+        ;;
+      PSKIP)
+        # $cfg = server name, $add = a path none of the configs can resolve.
+        if [ "$mode" = "dry" ]; then
+          echo "  ${YELLOW}MCP path skip:${RESET} [$cfg] every config points at a missing file ($add); left alone"
+        else
+          log "  MCP path skip: [$cfg] every config points at a missing file ($add); left alone"
+        fi
+        continue
+        ;;
+      PFIX)
+        # $cfg = server name, $add = the config being repaired, $upd = its
+        # missing path.
+        if [ "$mode" = "dry" ]; then
+          echo "  ${DIM}MCP path repair:${RESET} [$cfg] $add pointed at missing $upd"
+        else
+          log "  MCP path repair: [$cfg] $add pointed at missing $upd; replaced with the copy that resolves"
         fi
         continue
         ;;

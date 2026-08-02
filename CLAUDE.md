@@ -27,6 +27,7 @@ A Bash script (`claude-deck.sh`, macOS) and its PowerShell twin (`claude-deck.ps
 ./claude-deck.sh dash [port]         # start the local dashboard (default port 8965)
 ./claude-deck.sh stop [port]         # (alias: kill) stop the dashboard + quit every open profile
 ./claude-deck.sh doctor              # repair links, share new downloads, print the artifact inventory
+./claude-deck.sh mcp-doctor [--fix]  # find (and repair) mcpServers paths that no longer exist
 ./claude-deck.sh dedupe [--dry-run] [--report] [--convert-vm] [--seed-vm-all]  # share the CLI/VM downloads
 ./claude-deck.sh install             # copy to ~/.claude-deck/ + add zsh alias
 ./claude-deck.sh uninstall           # remove the alias only
@@ -179,6 +180,16 @@ Plain-language: the app used to download its own private ~246MB copy of the Clau
 Every profile launches the same patched app copy and points at the same `~/.claude`, so Claude Code transcripts, config, and settings are identical across every logged-in account. Only the Electron `userData` (chat history, cookies, local storage: the account login itself) is per-profile. This is the entire point: one 700MB app bundle, unlimited simultaneous logins, no duplicated installs.
 
 The one thing that used to be per-`userData`, and isn't anymore, is the Claude Code **session index** (as opposed to the transcripts themselves): see step 4's "Shares one Claude Code session index across profiles" above. Without that symlink, a second profile of the same account has its own empty index and shows no Code sessions even though the shared transcripts are sitting right there in `~/.claude/projects`. The symlink is what keeps this section's "identical across every logged-in account" claim actually true. `claude-sync` scans only the default app's single `claude-code-sessions` directory, so this symlink is also what keeps its single-directory assumption valid; seeing sessions from a genuinely *different* account still requires running `claude-sync` itself.
+
+## MCP server paths are machine state, not profile state
+
+Plain-language: an `mcpServers` entry that names a file path is only a note about where that file sits on this computer. When the file moves, every profile holds a wrong note, and the sync used to copy the wrong note around forever.
+
+- **The loop.** `Sync-McpServers` (ps1) and `CONFIG_SYNC_JS` (sh) pick ONE winning definition per server name by newest mtime and write it to every config. A plugin that moves its server file leaves every config stale; the plugin's own hook repairs one of them, which is a single vote among twelve and loses the moment any other config is touched. Hit live with `readable-card` (`plugins\marketplaces\smk\plugins\readable\mcp\server.js` after the plugin moved to `plugins\data\readable\server\server.js`), reproduced A/B against the pre-fix script.
+- **The rule: path health outranks recency.** A definition whose local absolute paths all resolve beats one that does not, whatever the mtimes say. `Get-McpBrokenPaths` / `brokenPaths()` judge only what the filesystem can settle: a Windows drive path, a UNC share, or a POSIX absolute path. A bare command resolved through PATH, a URL, a flag, and anything holding `${VAR}` are never judged. On Windows the *command* slot also tries PATHEXT, so `C:\Program Files\nodejs\node` counts as present (the live legacy config really is written that way, and calling it broken would have "repaired" a working entry).
+- **Nothing unrunnable is ever broadcast.** When every copy of a name is broken, it is not added where it is missing and not written over a config's own copy: one `MCP path skip` line, no writes. That is also the symmetric half of the guard, since the union pass IS the capture step, so a broken path read out of one profile can never be frozen into the others. Repairs log one `MCP path repair` line per config.
+- **The ps1 ledger had to become per-config actual** (matching the sh twin, which already was). It used to write "union minus removed" for every config. The moment the guard declines to add a name somewhere, that shared list is a lie, the next run reads the config as having LOST the server, which is exactly the removal-witness state, and one skipped entry would delete the server from every profile.
+- **`claude-deck mcp-doctor [--fix]`** is the out-of-band repair, and `doctor` calls it read-only. It scans the default instance, every profile, and (Windows) the legacy `%APPDATA%\Claude` copy that survives the MSIX escape and is still what a hook with a hardcoded path writes to. `--fix` swaps the path token as a JSON string literal in the RAW text, slot for slot, so key order, indentation, and the entry's own `env` (per-profile identity: tokens, per-account servers) survive byte for byte. Backup first (`.bak-mcp-path-<stamp>`), re-parse check before the write is trusted, idempotent.
 
 ## Migrating profiles to another machine
 

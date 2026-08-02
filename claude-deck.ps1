@@ -52,12 +52,14 @@ $ErrorActionPreference = 'Stop'
 
 $script:Force = $false
 $script:VerifyLaunch = $false
+$script:Fix = $false
 $script:AppOverride = $null
 if ($env:CLAUDE_DECK_APP) { $script:AppOverride = $env:CLAUDE_DECK_APP }
 $Positional = @()
 for ($i = 0; $i -lt $Rest.Count; $i++) {
   switch -Regex ($Rest[$i]) {
     '^(--force|-Force)$'                { $script:Force = $true }
+    '^(--fix|-Fix)$'                    { $script:Fix = $true }
     '^(--verify-launch|-VerifyLaunch)$' { $script:VerifyLaunch = $true }
     '^(--app|-App)$'                    { $i++; $script:AppOverride = $Rest[$i] }
     '^--app=(.+)$'                      { $script:AppOverride = $Matches[1] }
@@ -1396,9 +1398,217 @@ function Doctor-CheckInjectionFreshness {
   }
 }
 
+# ---------------------------------------------------------------------------
+# mcp-doctor: local absolute paths in mcpServers
+# ---------------------------------------------------------------------------
+# An mcpServers entry that names a local absolute path is a CACHE of where a
+# file sits on THIS machine, not per-profile state. The filesystem is the only
+# authority for it. Profiles legitimately differ on identity (env, tokens,
+# ${VAR} headers, per-account servers) and those are never touched here; they
+# must never disagree about where a plugin server file lives.
+#
+# Behaviourally identical twins: Get-McpBrokenPaths in sync\claude-sync.ps1,
+# brokenPaths() in sync/claude-sync.sh, _mcp_broken_paths in claude-deck.sh.
+# The one deliberate platform difference is PATHEXT, below.
+function Test-McpLooksAbsolute($Value) {
+  # Windows drive path, UNC share, or POSIX absolute. Anything else is not
+  # ours to judge: a bare command resolved through PATH, a URL, a flag, or a
+  # ${VAR} placeholder we cannot expand.
+  if ($null -eq $Value) { return $false }
+  $s = [string]$Value
+  if (-not $s) { return $false }
+  if ($s.Contains('${') -or $s.Contains('://')) { return $false }
+  return ($s -match '^[A-Za-z]:[\\/]' -or $s -match '^\\\\[^\\]' -or $s -match '^/[^/]')
+}
+
+function Test-McpPathPresent($Path, [bool]$IsCommand) {
+  # $IsCommand: Windows spawns a command through PATHEXT, so
+  # "C:\Program Files\nodejs\node" really does run even though no file has
+  # exactly that name. Only the command slot gets that benefit of the doubt;
+  # a script path in args must exist literally.
+  if (Test-Path -LiteralPath $Path) { return $true }
+  if ($IsCommand -and $env:PATHEXT) {
+    foreach ($ext in $env:PATHEXT.Split(';')) {
+      if ($ext -and (Test-Path -LiteralPath ($Path + $ext))) { return $true }
+    }
+  }
+  return $false
+}
+
+function Get-McpPathSlots($Def) {
+  # Every local absolute path a definition names, tagged with its slot
+  # ('command' or 'args[<i>]'). Repairs match slot for slot, so only the path
+  # token changes and everything else in the entry survives untouched.
+  $out = New-Object System.Collections.Generic.List[object]
+  if ($null -eq $Def) { return ,$out }
+  try {
+    $cmd = $Def.PSObject.Properties['command']
+    if ($cmd -and (Test-McpLooksAbsolute $cmd.Value)) {
+      $out.Add(@{ Slot = 'command'; Value = [string]$cmd.Value; IsCommand = $true })
+    }
+    $ar = $Def.PSObject.Properties['args']
+    if ($ar -and $null -ne $ar.Value) {
+      $list = @($ar.Value)
+      for ($i = 0; $i -lt $list.Count; $i++) {
+        if (Test-McpLooksAbsolute $list[$i]) {
+          $out.Add(@{ Slot = "args[$i]"; Value = [string]$list[$i]; IsCommand = $false })
+        }
+      }
+    }
+  } catch {}
+  return ,$out
+}
+
+function Get-McpConfigTargets {
+  # Every claude_desktop_config.json a Claude instance or a plugin hook can
+  # touch on this machine: the default instance, every named profile, and the
+  # legacy %APPDATA%\Claude copy, which survives the MSIX-escape migration and
+  # is still what a hook with a hardcoded path writes to.
+  $dirs = New-Object System.Collections.Generic.List[object]
+  # Under the escaped root the default instance lives INSIDE the profiles
+  # root, so the enumeration below already covers it. Same test Sync-SshConfigs
+  # uses, and it beats comparing path strings: one side can arrive as an 8.3
+  # short path or in different case, and then the string dedup below silently
+  # lists the default instance twice.
+  if ($DefaultUserDataDir -ne (Join-Path $ProfilesUserDataRoot 'default')) {
+    $dirs.Add(@{ Name = 'default'; Dir = $DefaultUserDataDir })
+  }
+  if (Test-Path -LiteralPath $ProfilesUserDataRoot) {
+    foreach ($d in @(Get-ChildItem -LiteralPath $ProfilesUserDataRoot -Directory -ErrorAction SilentlyContinue)) {
+      $dirs.Add(@{ Name = $d.Name; Dir = $d.FullName })
+    }
+  }
+  $dirs.Add(@{ Name = 'appdata-legacy'; Dir = (Join-Path $env:APPDATA 'Claude') })
+
+  $out  = New-Object System.Collections.Generic.List[object]
+  $seen = @{}
+  foreach ($d in $dirs) {
+    $p = Join-Path $d.Dir 'claude_desktop_config.json'
+    $key = $p.ToLowerInvariant()
+    if ($seen.ContainsKey($key)) { continue }
+    if (-not (Test-Path -LiteralPath $p)) { continue }
+    $seen[$key] = $true
+    $out.Add(@{ Name = $d.Name; Path = $p })
+  }
+  return ,$out
+}
+
+function Cmd-McpDoctor {
+  $targets = Get-McpConfigTargets
+  if ($targets.Count -eq 0) {
+    Note "No claude_desktop_config.json found under: $ProfilesUserDataRoot"
+    return
+  }
+
+  # Pass 1: read every config, list every path slot, and remember the first
+  # definition per server name whose paths all resolve. That one is the donor:
+  # disk truth, not the newest file, decides what a repair writes.
+  $rows   = New-Object System.Collections.Generic.List[object]
+  $donor  = @{}
+  $parsed = New-Object System.Collections.Generic.List[object]
+  foreach ($t in $targets) {
+    $json = $null
+    try { $json = (Get-Content -LiteralPath $t.Path -Raw -ErrorAction Stop | ConvertFrom-Json) } catch {
+      Warn ("  {0}: not valid JSON, skipped ({1})" -f $t.Name, $t.Path)
+      continue
+    }
+    $mProp = $null
+    if ($json) { $mProp = $json.PSObject.Properties['mcpServers'] }
+    if (-not $mProp -or $null -eq $mProp.Value) { continue }
+    $parsed.Add(@{ Target = $t; Servers = $mProp.Value })
+    foreach ($prop in @($mProp.Value.PSObject.Properties)) {
+      $slots = Get-McpPathSlots $prop.Value
+      if ($slots.Count -eq 0) { continue }   # npx/remote: no local path to judge
+      $healthy = $true
+      foreach ($s in $slots) {
+        $exists = Test-McpPathPresent $s.Value ([bool]$s.IsCommand)
+        if (-not $exists) { $healthy = $false }
+        $rows.Add(@{ Profile = $t.Name; Server = $prop.Name; Slot = $s.Slot
+                     Path = $s.Value; Exists = $exists; Action = '-'; Replacement = $null })
+      }
+      if ($healthy -and -not $donor.ContainsKey($prop.Name)) { $donor[$prop.Name] = $slots }
+    }
+  }
+
+  # Pass 2: decide an action for every broken row. Healthy rows keep '-'.
+  $fixable = 0
+  foreach ($r in $rows) {
+    if ($r.Exists) { continue }
+    if (-not $donor.ContainsKey($r.Server)) { $r.Action = 'no donor'; continue }
+    $repl = $null
+    foreach ($s in $donor[$r.Server]) { if ($s.Slot -eq $r.Slot) { $repl = $s.Value } }
+    if (-not $repl -or $repl -eq $r.Path) { $r.Action = 'no donor'; continue }
+    $r.Replacement = $repl
+    $r.Action = if ($script:Fix) { 'repair' } else { 'would repair' }
+    $fixable++
+  }
+
+  # Pass 3: apply, one file at a time, as a targeted token swap. The path is
+  # replaced as a JSON string literal in the raw text, so every other byte of
+  # the file (key order, indentation, env blocks, tokens) is preserved exactly.
+  if ($script:Fix -and $fixable -gt 0) {
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+    foreach ($t in $targets) {
+      $mine = @($rows | Where-Object { $_.Profile -eq $t.Name -and $_.Action -eq 'repair' })
+      if ($mine.Count -eq 0) { continue }
+      $text = [System.IO.File]::ReadAllText($t.Path)
+      $orig = $text
+      foreach ($r in $mine) {
+        $from = ConvertTo-Json -InputObject $r.Path -Compress
+        $to   = ConvertTo-Json -InputObject $r.Replacement -Compress
+        if (-not $text.Contains($from)) { $r.Action = 'token not found'; continue }
+        $text = $text.Replace($from, $to)
+      }
+      if ($text -eq $orig) { continue }
+      # A text-level edit gets a parse check before it is trusted, and the
+      # backup is written first so a bad write is always one copy from undone.
+      $bad = $false
+      try { ConvertFrom-Json $text | Out-Null } catch { $bad = $true }
+      if ($bad) {
+        Warn ("  {0}: repair would not re-parse as JSON, left untouched." -f $t.Name)
+        foreach ($r in $mine) { if ($r.Action -eq 'repair') { $r.Action = 'aborted' } }
+        continue
+      }
+      Copy-Item -LiteralPath $t.Path -Destination "$($t.Path).bak-mcp-path-$stamp" -Force
+      [System.IO.File]::WriteAllText($t.Path, $text)
+      foreach ($r in $mine) { if ($r.Action -eq 'repair') { $r.Action = 'repaired' } }
+    }
+  }
+
+  if ($rows.Count -eq 0) {
+    Note 'No mcpServers entry on this machine names a local absolute path.'
+    return
+  }
+
+  $wp = [Math]::Max(7, (@($rows | ForEach-Object { $_.Profile.Length }) | Measure-Object -Maximum).Maximum)
+  $ws = [Math]::Max(6, (@($rows | ForEach-Object { $_.Server.Length })  | Measure-Object -Maximum).Maximum)
+  Write-Host ("{0,-$wp}  {1,-$ws}  {2,-6}  {3,-14}  {4}" -f 'PROFILE', 'SERVER', 'EXISTS', 'ACTION', 'PATH')
+  foreach ($r in $rows) {
+    $line = ("{0,-$wp}  {1,-$ws}  {2,-6}  {3,-14}  {4}" -f $r.Profile, $r.Server,
+             $(if ($r.Exists) { 'yes' } else { 'no' }), $r.Action, $r.Path)
+    if ($r.Exists) { Note $line } else { Warn $line }
+  }
+
+  $broken = @($rows | Where-Object { -not $_.Exists }).Count
+  Write-Host ''
+  if ($broken -eq 0) {
+    Ok ("[OK] {0} path(s) across {1} config(s): all present." -f $rows.Count, $targets.Count)
+  } elseif ($script:Fix) {
+    $done = @($rows | Where-Object { $_.Action -eq 'repaired' }).Count
+    Ok ("[OK] {0} of {1} broken path(s) repaired. Re-run to confirm." -f $done, $broken)
+    if ($done -lt $broken) { Warn 'The rest have no working copy anywhere: reinstall the plugin, then re-run.' }
+  } else {
+    Warn ("{0} broken path(s) found; {1} can be repaired." -f $broken, $fixable)
+    Note 'Run: claude-deck mcp-doctor -Fix'
+  }
+}
+
 function Cmd-Doctor {
   Step 'Repairing session-index links for every named profile...'
   Repair-AllProfiles
+
+  Step 'Checking mcpServers for local paths that no longer exist...'
+  Cmd-McpDoctor
 
   try {
     if (Resolve-AppPaths) {
@@ -1538,8 +1748,14 @@ Usage:
                          focused, org untouched)
   claude-deck list       list known profiles (running? key captured?)
   claude-deck dash [port] run the local usage dashboard (default port 8965)
-  claude-deck doctor     repair every profile's session-index link, check
-                         patch freshness
+  claude-deck doctor     repair every profile's session-index link, report
+                         broken mcpServers paths, check patch freshness
+  claude-deck mcp-doctor [-Fix]
+                         list every mcpServers entry that names a local
+                         absolute path, across all profiles and the live
+                         config, with exists yes/no. -Fix rewrites a missing
+                         path to the working copy found in another config
+                         (backup first, path token only, idempotent)
   claude-deck install    add a 'claude-deck' function to your PS profile
   claude-deck uninstall  remove the 'claude-deck' function only
   claude-deck help       this message
@@ -1562,7 +1778,8 @@ switch ($Command) {
   'open'      { Cmd-Open $(if ($Positional.Count -gt 0) { $Positional[0] } else { '' }) $(if ($Positional.Count -gt 1) { $Positional[1] } else { '' }) }
   'list'      { Cmd-List }
   'dash'      { Cmd-Dash $(if ($Positional.Count -gt 0) { $Positional[0] } else { '' }) }
-  'doctor'    { Cmd-Doctor }
+  'doctor'     { Cmd-Doctor }
+  'mcp-doctor' { Cmd-McpDoctor }
   'install'   { Cmd-Install }
   'uninstall' { Cmd-Uninstall }
   'watchdog'  {

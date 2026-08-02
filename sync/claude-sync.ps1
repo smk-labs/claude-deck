@@ -323,6 +323,65 @@ function ConvertTo-CanonicalJson {
     return (ConvertTo-Json -InputObject $Value -Compress -Depth 64)
 }
 
+# ---------- MCP path health -------------------------------------------------
+# An mcpServers entry that names a local absolute path is a CACHE of where a
+# file sits on THIS machine, not per-profile state. The filesystem is the only
+# authority for it. Profiles legitimately differ on identity (env, tokens,
+# ${VAR} headers); they must never disagree about where a plugin's server file
+# lives, and a config must never win that argument against the disk.
+#
+# Behaviourally identical twin: Get-McpBrokenPaths in claude-deck.ps1 and the
+# brokenPaths() helper inside CONFIG_SYNC_JS in claude-sync.sh. Keep the three
+# in step; the one deliberate platform difference is PATHEXT, below.
+function Test-McpLooksAbsolute {
+    # Windows drive path, UNC share, or POSIX absolute. Anything else is not
+    # ours to judge: a bare command resolved through PATH, a URL, a flag, or
+    # a ${VAR} placeholder we cannot expand.
+    param($Value)
+    if ($null -eq $Value) { return $false }
+    $s = [string]$Value
+    if (-not $s) { return $false }
+    if ($s.Contains('${') -or $s.Contains('://')) { return $false }
+    return ($s -match '^[A-Za-z]:[\\/]' -or $s -match '^\\\\[^\\]' -or $s -match '^/[^/]')
+}
+
+function Test-McpPathPresent {
+    # $IsCommand: Windows spawns a command through PATHEXT, so
+    # "C:\Program Files\nodejs\node" really does run even though no file has
+    # exactly that name. Only the command slot gets that benefit of the doubt;
+    # a script path in args must exist literally.
+    param([string]$Path, [bool]$IsCommand)
+    if (Test-Path -LiteralPath $Path) { return $true }
+    if ($IsCommand -and $env:PATHEXT) {
+        foreach ($ext in $env:PATHEXT.Split(';')) {
+            if ($ext -and (Test-Path -LiteralPath ($Path + $ext))) { return $true }
+        }
+    }
+    return $false
+}
+
+function Get-McpBrokenPaths {
+    # Every local absolute path this definition points at that is NOT on disk.
+    # Empty = healthy, which includes "names no local path at all" (an
+    # npx-launched remote server is always healthy here).
+    param($Def)
+    $bad = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Def) { return ,$bad }
+    try {
+        $cmd = $Def.PSObject.Properties['command']
+        if ($cmd -and (Test-McpLooksAbsolute $cmd.Value) -and
+            -not (Test-McpPathPresent ([string]$cmd.Value) $true)) { $bad.Add([string]$cmd.Value) }
+        $ar = $Def.PSObject.Properties['args']
+        if ($ar -and $null -ne $ar.Value) {
+            foreach ($a in @($ar.Value)) {
+                if ((Test-McpLooksAbsolute $a) -and
+                    -not (Test-McpPathPresent ([string]$a) $false)) { $bad.Add([string]$a) }
+            }
+        }
+    } catch {}
+    return ,$bad
+}
+
 function Read-McpLedger {
     # "cfgPath<TAB>serverName" rows recording which MCP servers EACH config
     # held at the end of the last sync, returned as
@@ -444,17 +503,31 @@ function Sync-McpServers {
 
     # Union pass: pick a winning definition per server name. Effective mtime
     # throughout, so a stale config never wins a conflict with its old copy.
+    #
+    # PATH HEALTH OUTRANKS RECENCY. A definition whose local absolute paths are
+    # all on disk beats one that is not, whatever the mtimes say. Without this
+    # a plugin that moves its server file leaves 12 configs holding the old
+    # path; the one config a plugin hook repaired is a single vote among them
+    # and loses the moment any other config is touched, so the repair is undone
+    # on every run and the loop never ends.
     $order    = New-Object System.Collections.Generic.List[string]
     $chosen   = @{}
     $chosenMt = @{}
+    $chosenOk = @{}
+    $brokenAt = @{}   # name -> a missing path we saw, for the log line
     foreach ($cfg in $States) {
         $mProp = $cfg.Json.PSObject.Properties['mcpServers']
         if (-not $mProp -or $null -eq $mProp.Value) { continue }
         foreach ($prop in @($mProp.Value.PSObject.Properties)) {
             $k = $prop.Name
+            $bad = Get-McpBrokenPaths $prop.Value
+            $ok  = ($bad.Count -eq 0)
+            if (-not $ok -and -not $brokenAt.ContainsKey($k)) { $brokenAt[$k] = $bad[0] }
             if (-not $chosen.ContainsKey($k)) {
-                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.EffMt; $order.Add($k)
-            } elseif ($cfg.EffMt -gt $chosenMt[$k] -and
+                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.EffMt; $chosenOk[$k] = $ok; $order.Add($k)
+            } elseif ($ok -and -not $chosenOk[$k]) {
+                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.EffMt; $chosenOk[$k] = $true
+            } elseif ($ok -eq $chosenOk[$k] -and $cfg.EffMt -gt $chosenMt[$k] -and
                       (ConvertTo-CanonicalJson $prop.Value) -ne (ConvertTo-CanonicalJson $chosen[$k])) {
                 $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.EffMt
             }
@@ -477,8 +550,18 @@ function Sync-McpServers {
         }
     }
 
+    # One line per name whose every copy on this machine is unrunnable. Not an
+    # error and not a removal: the file may be a plugin reinstall away. It is
+    # simply never broadcast, so no config gets a path it cannot run.
+    $skips = New-Object System.Collections.Generic.List[string]
+    foreach ($k in $order) {
+        if ($removed.ContainsKey($k) -or $chosenOk[$k]) { continue }
+        $skips.Add(('  MCP path skip: [{0}] every config points at a missing file ({1}); left alone' -f $k, $brokenAt[$k]))
+    }
+
     # Per-config plan: what to add, update, remove.
     $plans = New-Object System.Collections.Generic.List[object]
+    $fixes = New-Object System.Collections.Generic.List[string]
     foreach ($cfg in $States) {
         $mProp = $cfg.Json.PSObject.Properties['mcpServers']
         $m = if ($mProp) { $mProp.Value } else { $null }
@@ -491,8 +574,19 @@ function Sync-McpServers {
                 if ($hasProp) { $del.Add($k) }
                 continue
             }
+            # Nothing runnable to spread: neither added where it is missing nor
+            # written over a config's own copy. Also the symmetric half of the
+            # guard, since this union pass IS the capture step: a broken path
+            # read out of one profile can never be frozen into the others.
+            if (-not $chosenOk[$k]) { continue }
             if (-not $hasProp) { $add.Add($k) }
-            elseif ((ConvertTo-CanonicalJson $m.$k) -ne (ConvertTo-CanonicalJson $chosen[$k])) { $upd.Add($k) }
+            elseif ((ConvertTo-CanonicalJson $m.$k) -ne (ConvertTo-CanonicalJson $chosen[$k])) {
+                $upd.Add($k)
+                $mine = Get-McpBrokenPaths $m.$k
+                if ($mine.Count -gt 0) {
+                    $fixes.Add(('  MCP path repair: [{0}] {1} pointed at missing {2}; replaced with the copy that resolves' -f $k, $cfg.Path, $mine[0]))
+                }
+            }
         }
         if (($add.Count + $upd.Count + $del.Count) -gt 0) {
             $plans.Add(@{ Cfg = $cfg; Add = $add; Upd = $upd; Del = $del })
@@ -501,6 +595,8 @@ function Sync-McpServers {
 
     if ($DryRun) {
         foreach ($v in $votes) { Write-Host $v }
+        foreach ($s in $skips) { Write-Host $s }
+        foreach ($f in $fixes) { Write-Host $f }
         foreach ($p in $plans) {
             if ($p.Add.Count) { Write-Host ('  would add MCP server(s) [{0}] -> {1}' -f ($p.Add -join ','), $p.Cfg.Path) }
             if ($p.Upd.Count) { Write-Host ('  would update MCP server(s) [{0}] -> {1}' -f ($p.Upd -join ','), $p.Cfg.Path) }
@@ -510,6 +606,8 @@ function Sync-McpServers {
     }
 
     foreach ($v in $votes) { Write-Log $v }
+    foreach ($s in $skips) { Write-Log $s }
+    foreach ($f in $fixes) { Write-Log $f }
 
     foreach ($p in $plans) {
         $cfg = $p.Cfg
@@ -544,18 +642,21 @@ function Sync-McpServers {
 
     # Persist the per-config "holds these servers" ledger for the next run,
     # every run and not just the ones that wrote: an unchanged run is also
-    # what replaces a stale v4.1-format ledger with the new one. Every config
-    # ends this pass holding the same set (the union-add path adds every
-    # non-removed name everywhere), so one list feeds all the rows. Written
-    # atomically (temp file then move) so a crash mid-write never leaves a
-    # truncated ledger; a missing or empty ledger is a normal, safe starting
-    # state (no votes).
+    # what replaces a stale v4.1-format ledger with the new one. Rows come from
+    # what each config ACTUALLY holds after this pass (its own parsed object,
+    # mutated in place above), matching the macOS twin. A shared "union minus
+    # removed" list would be a lie the moment the path guard declines to add a
+    # name somewhere: next run that config looks like it LOST the server, which
+    # is exactly the witness state, and one skipped entry would delete the
+    # server from every profile. Written atomically (temp file then move) so a
+    # crash mid-write never leaves a truncated ledger; a missing or empty
+    # ledger is a normal, safe starting state (no votes).
     New-Item -ItemType Directory -Force -Path $CanonicalDir | Out-Null
-    $fin = New-Object System.Collections.Generic.List[string]
-    foreach ($k in $order) { if (-not $removed.ContainsKey($k)) { $fin.Add($k) } }
     $rows = New-Object System.Collections.Generic.List[string]
     foreach ($cfg in $States) {
-        foreach ($k in $fin) { $rows.Add(("{0}`t{1}" -f $cfg.Path, $k)) }
+        $mProp = $cfg.Json.PSObject.Properties['mcpServers']
+        if (-not $mProp -or $null -eq $mProp.Value) { continue }
+        foreach ($k in @($mProp.Value.PSObject.Properties.Name)) { $rows.Add(("{0}`t{1}" -f $cfg.Path, $k)) }
     }
     $tmp = "$McpLedgerPath.tmp.$PID"
     if ($rows.Count -eq 0) { [System.IO.File]::WriteAllText($tmp, '') }

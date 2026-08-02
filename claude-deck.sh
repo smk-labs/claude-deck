@@ -2106,9 +2106,216 @@ _doctor_check_injection_freshness() {
   rm -rf "$extract_dir"
 }
 
+# ---------------------------------------------------------------------------
+# mcp-doctor: local absolute paths in mcpServers
+# ---------------------------------------------------------------------------
+# An mcpServers entry that names a local absolute path is a CACHE of where a
+# file sits on THIS machine, not per-profile state. The filesystem is the only
+# authority for it. Profiles legitimately differ on identity (env, tokens,
+# ${VAR} headers, per-account servers) and those are never touched here; they
+# must never disagree about where a plugin server file lives.
+#
+# Behaviourally identical twins: Get-McpBrokenPaths / Get-McpPathSlots in
+# claude-deck.ps1 and in sync/claude-sync.ps1, brokenPaths() inside
+# CONFIG_SYNC_JS in sync/claude-sync.sh. The one deliberate platform
+# difference is PATHEXT: the Windows twins let an extensionless command path
+# resolve as node.exe, macOS has no such rule and checks it literally.
+#
+#   argv: "scan" label cfg [label cfg ...]   -> ROW rows, one per path slot
+#         "fix"  cfg from to [from to ...]   -> "OK" or "ERR <why>"
+# Output: ROW<TAB>label<TAB>server<TAB>yes|no<TAB>replacement-or-dash<TAB>path
+#         BAD<TAB>label                      (config is not valid JSON)
+MCP_DOCTOR_JS='function run(argv) {
+  ObjC.import("Foundation");
+  function read(p) {
+    var s = $.NSString.stringWithContentsOfFileEncodingError($(p), $.NSUTF8StringEncoding, $());
+    return s.isNil() ? null : ObjC.unwrap(s);
+  }
+  function write(p, s) {
+    $(s).writeToFileAtomicallyEncodingError($(p), true, $.NSUTF8StringEncoding, $());
+  }
+  function onDisk(p) { return $.NSFileManager.defaultManager.fileExistsAtPath($(p)); }
+  function looksAbs(s) {
+    if (typeof s != "string" || !s) return false;
+    if (s.indexOf("${") >= 0 || s.indexOf("://") >= 0) return false;
+    return /^[A-Za-z]:[\\\/]/.test(s) || /^\\\\[^\\]/.test(s) || /^\/[^\/]/.test(s);
+  }
+  // (slot, value) for every local absolute path a definition names. A repair
+  // matches slot for slot, so only the path token changes and the rest of the
+  // entry (env, headers, tokens: per-profile identity) survives untouched.
+  function slots(d) {
+    var out = [];
+    if (!d || typeof d != "object" || Array.isArray(d)) return out;
+    if (looksAbs(d.command)) out.push({ slot: "command", value: d.command });
+    if (d.args && d.args.length) {
+      for (var i = 0; i < d.args.length; i++) {
+        if (looksAbs(d.args[i])) out.push({ slot: "args[" + i + "]", value: d.args[i] });
+      }
+    }
+    return out;
+  }
+
+  var mode = argv[0];
+  if (mode == "fix") {
+    // Targeted token swap on the RAW text: the path is replaced as a JSON
+    // string literal, so every other byte of the file (key order, indentation,
+    // env blocks) is preserved exactly. A parse check gates the write, because
+    // a text edit has no schema to protect it.
+    var p = argv[1], t = read(p);
+    if (t === null) return "ERR unreadable";
+    for (var i = 2; i + 1 < argv.length; i += 2) {
+      var from = JSON.stringify(argv[i]), to = JSON.stringify(argv[i + 1]);
+      if (t.indexOf(from) < 0) return "ERR token not found";
+      t = t.split(from).join(to);
+    }
+    try { JSON.parse(t); } catch (e) { return "ERR would not re-parse as JSON"; }
+    write(p, t);
+    return "OK";
+  }
+
+  var labels = [], files = [];
+  for (var i = 1; i + 1 < argv.length + 1; i += 2) { labels.push(argv[i]); files.push(argv[i + 1]); }
+  // Donor per server name: the FIRST definition whose paths all resolve. Disk
+  // truth, not the newest file, decides what a repair writes.
+  var rows = [], donor = {}, out = [];
+  for (var i = 0; i < files.length; i++) {
+    var t = read(files[i]), j;
+    try { j = (t && t.replace(/\s/g, "") !== "") ? JSON.parse(t) : {}; }
+    catch (e) { out.push("BAD\t" + labels[i]); continue; }
+    var m = (j && j.mcpServers) || {};
+    for (var k in m) {
+      var sl = slots(m[k]);
+      if (!sl.length) continue;   // npx/remote: no local path to judge
+      var healthy = true;
+      for (var q = 0; q < sl.length; q++) {
+        var ok = onDisk(sl[q].value);
+        if (!ok) healthy = false;
+        rows.push({ label: labels[i], server: k, slot: sl[q].slot, path: sl[q].value, ok: ok });
+      }
+      if (healthy && !(k in donor)) donor[k] = sl;
+    }
+  }
+  for (var r = 0; r < rows.length; r++) {
+    var repl = "-";
+    if (!rows[r].ok && (rows[r].server in donor)) {
+      var d = donor[rows[r].server];
+      for (var q = 0; q < d.length; q++) {
+        if (d[q].slot === rows[r].slot && d[q].value !== rows[r].path) repl = d[q].value;
+      }
+    }
+    out.push("ROW\t" + rows[r].label + "\t" + rows[r].server + "\t" +
+             (rows[r].ok ? "yes" : "no") + "\t" + repl + "\t" + rows[r].path);
+  }
+  return out.join("\n");
+}'
+
+cmd_mcp_doctor() {
+  local fix="no" arg
+  for arg in "$@"; do
+    case "$arg" in
+      --fix) fix="yes" ;;
+      *)     die "Unknown option for mcp-doctor: $arg (see: $0 --help)" ;;
+    esac
+  done
+
+  # Every claude_desktop_config.json a Claude instance reads on this machine:
+  # the default (flag-less) instance plus every named profile.
+  local targets=() label cfg d
+  cfg="$SHARED_ARTIFACT_ROOT/claude_desktop_config.json"
+  if [ -f "$cfg" ]; then targets+=("default" "$cfg"); fi
+  if [ -d "$PROFILES_USERDATA_ROOT" ]; then
+    for d in "$PROFILES_USERDATA_ROOT"/*/; do
+      if [ ! -d "$d" ]; then continue; fi
+      label="$(basename "$d")"
+      cfg="${d%/}/claude_desktop_config.json"
+      if [ -f "$cfg" ]; then targets+=("$label" "$cfg"); fi
+    done
+  fi
+  if [ ${#targets[@]} -eq 0 ]; then
+    c_dim "No claude_desktop_config.json found under: $PROFILES_USERDATA_ROOT"
+    return 0
+  fi
+
+  local scan
+  scan="$(osascript -l JavaScript -e "$MCP_DOCTOR_JS" scan "${targets[@]}" 2>&1)" || {
+    c_yellow "mcp-doctor: could not read the configs (osascript failed)."
+    return 0
+  }
+  if [ -z "$scan" ]; then
+    c_dim "No mcpServers entry on this machine names a local absolute path."
+    return 0
+  fi
+
+  # Repair pass, one file at a time: back up first (the .bak-* convention),
+  # then let the JS do the token swap and its own re-parse check.
+  local stamp fixed=0 i n pairs res tag rlabel rserver rok rrepl rpath
+  if [ "$fix" = "yes" ]; then
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    i=0
+    n=${#targets[@]}
+    while [ "$i" -lt "$n" ]; do
+      label="${targets[$i]}"
+      cfg="${targets[$((i + 1))]}"
+      i=$((i + 2))
+      pairs=()
+      while IFS="$(printf '\t')" read -r tag rlabel rserver rok rrepl rpath; do
+        if [ "$tag" != "ROW" ] || [ "$rlabel" != "$label" ]; then continue; fi
+        if [ "$rok" != "no" ] || [ "$rrepl" = "-" ]; then continue; fi
+        pairs+=("$rpath" "$rrepl")
+      done <<EOF_SCAN
+$scan
+EOF_SCAN
+      if [ ${#pairs[@]} -eq 0 ]; then continue; fi
+      cp -p "$cfg" "$cfg.bak-mcp-path-$stamp"
+      res="$(osascript -l JavaScript -e "$MCP_DOCTOR_JS" fix "$cfg" "${pairs[@]}" 2>&1)" || res="ERR osascript failed"
+      case "$res" in
+        OK) fixed=$((fixed + ${#pairs[@]} / 2)) ;;
+        *)  c_yellow "  $label: $res; left untouched." ;;
+      esac
+    done
+    # Re-scan so the table below reports the state AFTER the repair, which is
+    # also what makes a second run print a clean table with no work to do.
+    scan="$(osascript -l JavaScript -e "$MCP_DOCTOR_JS" scan "${targets[@]}" 2>&1)" || true
+  fi
+
+  printf '%s\n' "$scan" | awk -v fixmode="$fix" -v fixed="$fixed" -F '\t' '
+    $1 == "BAD" { bad = bad "  " $2 "\n"; next }
+    $1 != "ROW" { next }
+    {
+      n++; L[n] = $2; S[n] = $3; E[n] = $4; R[n] = $5; P[n] = $6
+      if (length($2) > wl) wl = length($2)
+      if (length($3) > ws) ws = length($3)
+      if ($4 == "no") { broken++; if ($5 != "-") fixable++ }
+    }
+    END {
+      if (bad != "") printf "Not valid JSON, skipped:\n%s", bad
+      if (n == 0) { print "No mcpServers entry names a local absolute path."; exit }
+      if (wl < 7) wl = 7
+      if (ws < 6) ws = 6
+      printf "%-*s  %-*s  %-6s  %-14s  %s\n", wl, "PROFILE", ws, "SERVER", "EXISTS", "ACTION", "PATH"
+      for (i = 1; i <= n; i++) {
+        act = "-"
+        if (E[i] == "no") act = (R[i] == "-") ? "no donor" : (fixmode == "yes" ? "unrepaired" : "would repair")
+        printf "%-*s  %-*s  %-6s  %-14s  %s\n", wl, L[i], ws, S[i], E[i], act, P[i]
+      }
+      print ""
+      if (broken == 0 && fixmode == "yes" && fixed > 0)
+        printf "[OK] %d broken path(s) repaired, %d path(s) now all present.\n", fixed, n
+      else if (broken == 0)
+        printf "[OK] %d path(s) checked: all present.\n", n
+      else if (fixmode == "yes")
+        printf "%d path(s) still broken with no working copy anywhere: reinstall the plugin, then re-run.\n", broken
+      else
+        printf "%d broken path(s) found; %d can be repaired. Run: claude-deck mcp-doctor --fix\n", broken, fixable
+    }'
+}
+
 cmd_doctor() {
   step "Repairing session-index links for every named profile..."
   _repair_all_profiles verbose
+
+  step "Checking mcpServers for local paths that no longer exist..."
+  cmd_mcp_doctor
 
   # Relinks version dirs a profile downloaded on its own since the last run
   # (every Claude Code update lands one per profile). Never converts an
@@ -2378,10 +2585,16 @@ Usage:
                          profile including default. The dashboard server
                          has no tie to Claude.app at all: quitting Claude
                          windows never stops it on its own.
-  $0 doctor              repair every profile's session-index link, share any
-                         newly-downloaded CLI/VM SDK copies, print the
-                         shared-artifact inventory, check patch freshness,
-                         run claude-sync if idle
+  $0 doctor              repair every profile's session-index link, report
+                         broken mcpServers paths, share any newly-downloaded
+                         CLI/VM SDK copies, print the shared-artifact
+                         inventory, check patch freshness, run claude-sync
+                         if idle
+  $0 mcp-doctor [--fix]  list every mcpServers entry that names a local
+                         absolute path, across all profiles and the default
+                         instance, with exists yes/no. --fix rewrites a
+                         missing path to the working copy found in another
+                         config (backup first, path token only, idempotent)
   $0 dedupe [--dry-run] [--report] [--convert-vm] [--seed-vm-all]
                          stop every profile from keeping its own copy of the
                          Claude Code CLI and Cowork VM SDK (~246MB each):
@@ -2430,6 +2643,7 @@ case "$SUBCOMMAND" in
   dash)           cmd_dash "$@" ;;
   stop|kill)      cmd_stop "$@" ;;
   doctor)         cmd_doctor ;;
+  mcp-doctor)     cmd_mcp_doctor "$@" ;;
   dedupe)         cmd_dedupe "$@" ;;
   install)        cmd_install ;;
   uninstall)      cmd_uninstall ;;
