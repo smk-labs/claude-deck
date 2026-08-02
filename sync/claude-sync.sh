@@ -266,6 +266,7 @@ ensure_run_dir() {
 #   STALE<TAB>cfg<TAB>names        (config ignored this run, names it lost)
 #   PSKIP<TAB>name<TAB>path        (every copy points at a missing file)
 #   PFIX<TAB>name<TAB>cfg<TAB>path (that cfg had a missing path, repaired)
+#   PENV<TAB>name<TAB>cfg<TAB>keys (env keys added there; own values kept)
 #   LEDGER<TAB>cfg<TAB>names       (post-write mcpServers set of that cfg)
 CONFIG_SYNC_JS='function run(argv) {
   ObjC.import("Foundation");
@@ -320,6 +321,47 @@ CONFIG_SYNC_JS='function run(argv) {
       }
     }
     return bad;
+  }
+  // env is per-profile IDENTITY. Everything else in an mcpServers entry says
+  // HOW to run a server and is the same on every profile, but env is where
+  // per-account credentials live, so replacing a whole entry with the winner
+  // hands one account token to every other account: the opposite of what
+  // separate profiles are for. command/args come from the winner; env keeps
+  // each config OWN values and only gains keys it does not have yet, so a
+  // server added in one profile still arrives complete everywhere. Deliberate
+  // cost: EDITING an existing env value in one profile no longer spreads.
+  // Twin: ConvertTo-CanonicalJsonNoEnv / Get-McpEnvMissing /
+  // Merge-McpDefinition in claude-sync.ps1.
+  function canonNoEnv(v) {
+    if (v === null || typeof v != "object" || Array.isArray(v)) return canon(v);
+    var o = {};
+    for (var k in v) { if (k != "env") o[k] = v[k]; }
+    return canon(o);
+  }
+  function envMissing(local, win) {
+    var out = [];
+    var w = (win && typeof win == "object" && !Array.isArray(win) && win.env) || null;
+    if (!w || typeof w != "object") return out;
+    var have = (local && typeof local == "object" && !Array.isArray(local) && local.env) || {};
+    for (var k in w) { if (!(k in have)) out.push(k); }
+    return out;
+  }
+  // Local keys keep their position and the winner field order is reproduced
+  // exactly, so a second run finds nothing left to change. Never mutates the
+  // winner: it is shared by every config.
+  function mergeDef(local, win) {
+    if (!win || typeof win != "object" || Array.isArray(win)) return win;
+    var out = {};
+    for (var k in win) { if (k != "env") out[k] = win[k]; }
+    var le = (local && typeof local == "object" && !Array.isArray(local) && local.env) || null;
+    var we = win.env || null;
+    if ((le && typeof le == "object") || (we && typeof we == "object")) {
+      var e = {};
+      if (le && typeof le == "object") { for (var k in le) e[k] = le[k]; }
+      if (we && typeof we == "object") { for (var k in we) { if (!(k in e)) e[k] = we[k]; } }
+      out.env = e;
+    }
+    return out;
   }
   var PREFS_NO_SYNC = { launchPreviewPersistedWorkspaces: 1, launchPreviewSessionScopedSessions: 1 };
 
@@ -396,7 +438,7 @@ CONFIG_SYNC_JS='function run(argv) {
       if (!ok && !(k in brokenAt)) brokenAt[k] = bad[0];
       if (!(k in chosen)) { chosen[k] = m[k]; chosenMt[k] = emt[i]; chosenOk[k] = ok; order.push(k); }
       else if (ok && !chosenOk[k]) { chosen[k] = m[k]; chosenMt[k] = emt[i]; chosenOk[k] = true; }
-      else if (ok === chosenOk[k] && emt[i] > chosenMt[k] && canon(m[k]) !== canon(chosen[k])) {
+      else if (ok === chosenOk[k] && emt[i] > chosenMt[k] && canonNoEnv(m[k]) !== canonNoEnv(chosen[k])) {
         chosen[k] = m[k]; chosenMt[k] = emt[i];
       }
     }
@@ -468,11 +510,19 @@ CONFIG_SYNC_JS='function run(argv) {
       // since this union pass IS the capture step: a broken path read out of
       // one profile can never be frozen into the others.
       if (!chosenOk[k]) continue;
+      // An ADD takes the winner whole, env included: there is no local value
+      // to protect, and a server arriving without its token is useless.
       if (!(k in m)) { add.push(k); m[k] = chosen[k]; }
-      else if (canon(m[k]) !== canon(chosen[k])) {
-        var mine = brokenPaths(m[k]);
-        if (mine.length) out.push("PFIX\t" + k + "\t" + files[i] + "\t" + mine[0]);
-        upd.push(k); m[k] = chosen[k];
+      else {
+        // env-blind: a profile holding its own token for a server is not a
+        // difference to reconcile. Missing env KEYS still are.
+        var eAdd = envMissing(m[k], chosen[k]);
+        if (canonNoEnv(m[k]) !== canonNoEnv(chosen[k]) || eAdd.length) {
+          var mine = brokenPaths(m[k]);
+          if (mine.length) out.push("PFIX\t" + k + "\t" + files[i] + "\t" + mine[0]);
+          if (eAdd.length) out.push("PENV\t" + k + "\t" + files[i] + "\t" + eAdd.join(","));
+          upd.push(k); m[k] = mergeDef(m[k], chosen[k]);
+        }
       }
     }
     var p = cfgs[i].preferences;
@@ -501,6 +551,29 @@ CONFIG_SYNC_JS='function run(argv) {
   }
   return out.join("\n");
 }'
+
+config_backup_name() {
+  # A config backup is named after its full path with the separators mangled.
+  # On a deep path that name alone runs past the 255-byte filename limit and
+  # the copy fails, so long names keep their tail (the readable part: profile
+  # dir + file name) behind a short hash of the full path, which also keeps
+  # two configs from ever colliding. Both call sites must use this, or the
+  # manifest would point --revert at a file that is not there.
+  local p safe
+  p="$1"
+  safe="$(printf '%s' "$p" | tr '/' '_')"
+  if [ ${#safe} -le 120 ]; then
+    printf '%s' "$safe"
+    return 0
+  fi
+  # Two statements, not one `a || b` pipeline: without pipefail the exit
+  # status of a broken pipeline is cut's (always 0), so the fallback would
+  # never fire and the hash would silently come out empty.
+  local h
+  h="$(printf '%s' "$p" | md5 -q 2>/dev/null)"
+  if [ -z "$h" ]; then h="$(printf '%s' "$p" | shasum 2>/dev/null | cut -d' ' -f1)"; fi
+  printf '%s_%s' "$(printf '%s' "$h" | cut -c1-8)" "$(printf '%s' "$safe" | tail -c 100)"
+}
 
 sync_configs() {
   # Reconcile the mcpServers and preferences blocks of
@@ -579,6 +652,16 @@ sync_configs() {
         fi
         continue
         ;;
+      PENV)
+        # $cfg = server name, $add = the config, $upd = env keys it gains.
+        # Only ever keys it lacks; values it already has are never touched.
+        if [ "$mode" = "dry" ]; then
+          echo "  ${DIM}MCP env add:${RESET} [$cfg] $add would gain [$upd]"
+        else
+          log "  MCP env add: [$cfg] $add gained [$upd] (existing values kept)"
+        fi
+        continue
+        ;;
       CHG) ;;
       *)   continue ;;
     esac
@@ -591,7 +674,15 @@ sync_configs() {
     fi
     ensure_run_dir
     mkdir -p "$RUN_DIR/configs"
-    cp -p "$cfg" "$RUN_DIR/configs/$(echo "$cfg" | tr '/' '_')"
+    # The write pass below rewrites every changed config in one go, so a
+    # backup that failed here would leave that file written with nothing to
+    # --revert to. Losing the undo is worse than skipping a run, so one failed
+    # copy cancels the whole config pass instead of being ignored (which is
+    # what used to happen: cp failed, the JS wrote anyway, no backup existed).
+    if ! cp -p "$cfg" "$RUN_DIR/configs/$(config_backup_name "$cfg")"; then
+      log "  Profile config: could not back up $cfg, so nothing was written this run."
+      return 0
+    fi
   done <<EOF_PLAN
 $plan_out
 EOF_PLAN
@@ -629,7 +720,7 @@ EOF_PLAN
     [ "$del" != "-" ]  && parts="$parts${parts:+, }removed MCP [$del]"
     [ "$pset" != "-" ] && parts="$parts${parts:+, }synced setting(s) [$pset]"
     log "  $parts -> $cfg"
-    printf 'overwrote\t%s\t%s\n' "$cfg" "$RUN_DIR/configs/$(echo "$cfg" | tr '/' '_')" >> "$MANIFEST"
+    printf 'overwrote\t%s\t%s\n' "$cfg" "$RUN_DIR/configs/$(config_backup_name "$cfg")" >> "$MANIFEST"
   done <<EOF_OUT
 $merge_out
 EOF_OUT

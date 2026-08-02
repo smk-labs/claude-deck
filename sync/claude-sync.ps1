@@ -323,6 +323,101 @@ function ConvertTo-CanonicalJson {
     return (ConvertTo-Json -InputObject $Value -Compress -Depth 64)
 }
 
+# ---------- env is per-profile identity -------------------------------------
+# Everything in an mcpServers entry describes HOW to run a server and is the
+# same on every profile, except `env`, which is where per-account credentials
+# live (API tokens, per-account server auth). Replacing a whole entry with the
+# winner therefore hands one account's token to every other account, which is
+# the opposite of what separate profiles are for.
+#
+# So: command, args and every other field come from the winner; `env` keeps
+# each config's OWN values, and only gains the keys it does not have yet, so a
+# server added in one profile still arrives complete everywhere. The cost, and
+# it is deliberate: EDITING an existing env value in one profile no longer
+# spreads to the others. Set it where you want it, or delete the key there and
+# let the next sync refill it.
+# Twin: canonNoEnv/envMissing/mergeDef inside CONFIG_SYNC_JS in claude-sync.sh.
+function ConvertTo-CanonicalJsonNoEnv {
+    # The update decision must be blind to env, or two profiles holding
+    # different tokens would overwrite each other on every single run.
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    try {
+        if (-not ($Value -is [psobject]) -or $Value -is [string] -or $Value -is [array]) {
+            return (ConvertTo-CanonicalJson $Value)
+        }
+        $copy = New-Object PSObject
+        foreach ($p in @($Value.PSObject.Properties)) {
+            if ($p.Name -eq 'env') { continue }
+            $copy | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value
+        }
+        return (ConvertTo-Json -InputObject $copy -Compress -Depth 64)
+    } catch { return (ConvertTo-CanonicalJson $Value) }
+}
+
+function Get-McpEnvMissing {
+    # env keys the winner has and this config does not. A non-empty result is
+    # the only env-shaped reason to rewrite a config.
+    param($Local, $Winner)
+    $missing = New-Object System.Collections.Generic.List[string]
+    try {
+        $w = $null
+        if ($null -ne $Winner) { $w = $Winner.PSObject.Properties['env'] }
+        if (-not $w -or $null -eq $w.Value) { return ,$missing }
+        $have = @{}
+        $l = $null
+        if ($null -ne $Local) { $l = $Local.PSObject.Properties['env'] }
+        if ($l -and $null -ne $l.Value) {
+            foreach ($e in @($l.Value.PSObject.Properties)) { $have[$e.Name] = $true }
+        }
+        foreach ($e in @($w.Value.PSObject.Properties)) {
+            if (-not $have.ContainsKey($e.Name)) { $missing.Add($e.Name) }
+        }
+    } catch {}
+    return ,$missing
+}
+
+function Merge-McpDefinition {
+    # The object actually written into one config: winner's fields, this
+    # config's own env values, winner-only env keys appended. Local keys keep
+    # their position and the winner's field order is reproduced exactly, so a
+    # second run finds nothing left to change (the ps1 comparison is property
+    # ORDER sensitive; an unstable merge here would rewrite every config on
+    # every run forever). Never mutates $Winner: it is shared by every config.
+    param($Local, $Winner)
+    if ($null -eq $Winner) { return $Winner }
+    try {
+        if (-not ($Winner -is [psobject]) -or $Winner -is [string] -or $Winner -is [array]) { return $Winner }
+        $out = New-Object PSObject
+        foreach ($p in @($Winner.PSObject.Properties)) {
+            if ($p.Name -eq 'env') { continue }
+            $out | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value
+        }
+        $lEnv = $null
+        if ($null -ne $Local) { $lEnv = $Local.PSObject.Properties['env'] }
+        $wEnv = $Winner.PSObject.Properties['env']
+        if (($lEnv -and $null -ne $lEnv.Value) -or ($wEnv -and $null -ne $wEnv.Value)) {
+            $merged = New-Object PSObject
+            $seen = @{}
+            if ($lEnv -and $null -ne $lEnv.Value) {
+                foreach ($e in @($lEnv.Value.PSObject.Properties)) {
+                    $merged | Add-Member -NotePropertyName $e.Name -NotePropertyValue $e.Value
+                    $seen[$e.Name] = $true
+                }
+            }
+            if ($wEnv -and $null -ne $wEnv.Value) {
+                foreach ($e in @($wEnv.Value.PSObject.Properties)) {
+                    if (-not $seen.ContainsKey($e.Name)) {
+                        $merged | Add-Member -NotePropertyName $e.Name -NotePropertyValue $e.Value
+                    }
+                }
+            }
+            $out | Add-Member -NotePropertyName 'env' -NotePropertyValue $merged
+        }
+        return $out
+    } catch { return $Winner }
+}
+
 # ---------- MCP path health -------------------------------------------------
 # An mcpServers entry that names a local absolute path is a CACHE of where a
 # file sits on THIS machine, not per-profile state. The filesystem is the only
@@ -380,6 +475,21 @@ function Get-McpBrokenPaths {
         }
     } catch {}
     return ,$bad
+}
+
+function Get-ConfigBackupName {
+    # A config's backup file is named after its full path with the separators
+    # mangled. On a deep path that name alone runs past MAX_PATH once the run
+    # dir is prepended, Copy-Item throws, and $ErrorActionPreference='Stop'
+    # takes the WHOLE sync down with it (seen while testing). Long names keep
+    # their tail, which is the readable part (profile dir + file name), behind
+    # a short hash of the full path so two configs can never collide.
+    param([string]$Path)
+    $safe = $Path -replace '[:\\/]', '_'
+    if ($safe.Length -le 120) { return $safe }
+    $md5 = [Security.Cryptography.MD5]::Create()
+    $hash = [BitConverter]::ToString($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($Path))).Replace('-', '').Substring(0, 8)
+    return ($hash + '_' + $safe.Substring($safe.Length - 100))
 }
 
 function Read-McpLedger {
@@ -528,7 +638,7 @@ function Sync-McpServers {
             } elseif ($ok -and -not $chosenOk[$k]) {
                 $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.EffMt; $chosenOk[$k] = $true
             } elseif ($ok -eq $chosenOk[$k] -and $cfg.EffMt -gt $chosenMt[$k] -and
-                      (ConvertTo-CanonicalJson $prop.Value) -ne (ConvertTo-CanonicalJson $chosen[$k])) {
+                      (ConvertTo-CanonicalJsonNoEnv $prop.Value) -ne (ConvertTo-CanonicalJsonNoEnv $chosen[$k])) {
                 $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.EffMt
             }
         }
@@ -580,11 +690,20 @@ function Sync-McpServers {
             # read out of one profile can never be frozen into the others.
             if (-not $chosenOk[$k]) { continue }
             if (-not $hasProp) { $add.Add($k) }
-            elseif ((ConvertTo-CanonicalJson $m.$k) -ne (ConvertTo-CanonicalJson $chosen[$k])) {
-                $upd.Add($k)
-                $mine = Get-McpBrokenPaths $m.$k
-                if ($mine.Count -gt 0) {
-                    $fixes.Add(('  MCP path repair: [{0}] {1} pointed at missing {2}; replaced with the copy that resolves' -f $k, $cfg.Path, $mine[0]))
+            else {
+                # env-blind: a profile holding its own token for a server is
+                # not a difference to reconcile. Missing env KEYS still are.
+                $envAdd = Get-McpEnvMissing $m.$k $chosen[$k]
+                if ((ConvertTo-CanonicalJsonNoEnv $m.$k) -ne (ConvertTo-CanonicalJsonNoEnv $chosen[$k]) -or
+                    $envAdd.Count -gt 0) {
+                    $upd.Add($k)
+                    $mine = Get-McpBrokenPaths $m.$k
+                    if ($mine.Count -gt 0) {
+                        $fixes.Add(('  MCP path repair: [{0}] {1} pointed at missing {2}; replaced with the copy that resolves' -f $k, $cfg.Path, $mine[0]))
+                    }
+                    if ($envAdd.Count -gt 0) {
+                        $fixes.Add(('  MCP env add: [{0}] {1} gained {2} (existing values kept)' -f $k, $cfg.Path, ($envAdd -join ',')))
+                    }
                 }
             }
         }
@@ -614,8 +733,18 @@ function Sync-McpServers {
         Initialize-RunDir
         $cfgBackupDir = Join-Path $script:RunDir 'configs'
         New-Item -ItemType Directory -Force -Path $cfgBackupDir | Out-Null
-        $backupPath = Join-Path $cfgBackupDir ($cfg.Path -replace '[:\\/]', '_')
-        Copy-Item -LiteralPath $cfg.Path -Destination $backupPath
+        $backupPath = Join-Path $cfgBackupDir (Get-ConfigBackupName $cfg.Path)
+        try {
+            Copy-Item -LiteralPath $cfg.Path -Destination $backupPath -ErrorAction Stop
+        } catch {
+            # Two rules meet here. Never write a config we could not back up
+            # first, or -Revert has nothing to restore. And never let one
+            # config take the whole sync down: $ErrorActionPreference='Stop'
+            # used to turn a single failed copy (a long path, a permission
+            # problem) into a dead run that reconciled nothing at all.
+            Write-Log ("  Skipped {0}: could not back it up first ({1})" -f $cfg.Path, $_.Exception.Message)
+            continue
+        }
 
         # Mutate the parsed config in place: existing servers keep their
         # position, new ones are appended, every other key is untouched.
@@ -627,7 +756,9 @@ function Sync-McpServers {
             $m = $mProp.Value
         }
         foreach ($k in $p.Del) { $m.PSObject.Properties.Remove($k) }
-        foreach ($k in $p.Upd) { $m.$k = $chosen[$k] }
+        foreach ($k in $p.Upd) { $m.$k = Merge-McpDefinition $m.$k $chosen[$k] }
+        # An ADD takes the winner whole, env included: there is no local value
+        # to protect, and a server that arrives without its token is useless.
         foreach ($k in $p.Add) { $m | Add-Member -NotePropertyName $k -NotePropertyValue $chosen[$k] }
 
         [System.IO.File]::WriteAllText($cfg.Path, ((ConvertTo-Json -InputObject $cfg.Json -Depth 64) + "`n"))
