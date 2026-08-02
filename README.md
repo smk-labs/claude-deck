@@ -15,6 +15,7 @@
 - **A local dashboard** showing usage per account AND per organization (an account in several orgs gets one section per org), rendering usage windows dynamically from whatever the API returns, so new model buckets (like a Fable weekly limit) show up automatically with no code change, with one-click open or focus per profile.
 - **Add profiles from the dashboard.** Click **New profile**, name it, and Claude opens on that profile so you can log in. Profiles made anywhere else (`claude-deck open <name>`, another browser tab) show up on their own within seconds: the dashboard lists profile folders, not just the ones it has a key for.
 - **Window titles tagged `[profile]`** so Cmd-backtick, Mission Control, and Raycast can tell your accounts apart.
+- **One session list across every account.** `claude-sync` (in [`sync/`](sync/)) puts every account's Claude Code sessions in one shared list, and keeps MCP servers, app settings, and extensions identical across profiles. Install it separately, in one command.
 - **Optional Cursor integration.** See idle [Cursor](https://cursor.com) seats' usage in the same dashboard, and delegate self-contained tasks to them from Claude Code (agent calling). Zero dependency, off by default. See [Cursor accounts](#cursor-accounts-optional).
 
 ---
@@ -24,7 +25,7 @@
 macOS:
 
 ```bash
-git clone https://github.com/SMKeramati/claude-deck.git
+git clone https://github.com/smk-labs/claude-deck.git
 cd claude-deck
 ./claude-deck.sh install
 claude-deck patch
@@ -35,7 +36,7 @@ claude-deck dash
 Windows (PowerShell):
 
 ```powershell
-git clone https://github.com/SMKeramati/claude-deck.git
+git clone https://github.com/smk-labs/claude-deck.git
 cd claude-deck
 .\claude-deck.ps1 install
 claude-deck patch
@@ -87,7 +88,7 @@ The same commands work on Windows via `claude-deck.ps1` (except `watchdog`, see 
 
 Profiles share one Claude Code session index (it's symlinked into the default app's own index folder), so every profile of the **same** account sees the same session list instantly. No extra step needed.
 
-To see Claude Code sessions **across different accounts**, use the companion tool [claude-sync](https://github.com/smk-labs/claude-sync): start one throwaway Claude Code session in the new account first, then run claude-sync (or its auto watcher).
+To see Claude Code sessions **across different accounts**, use [`sync/claude-sync`](sync/), which ships in this repo: start one throwaway Claude Code session in the new account first, then run claude-sync (or its auto watcher). It installs itself in one command and has [its own README](sync/README.md).
 
 **Self-healing.** The index link no longer depends on the app patch being current: every `claude-deck open <name>` (and every open from the dashboard) repairs or creates the profile's session-index link before launching, and `claude-deck dash` repairs all profiles at startup. If something still looks off, run `claude-deck doctor`: it fixes every profile's link in one pass, tells you if the installed patch carries an outdated injection, and runs claude-sync for you when Claude is closed.
 
@@ -116,7 +117,7 @@ Run each Cursor account in its own login the VS Code way: `open -na Cursor --arg
 
 ### Delegate work to Cursor from Claude Code
 
-Put those seats to work: Claude Code (terminal or the Desktop Code tab) can hand a self-contained slice to `cursor-agent`, which runs it on the Cursor subscription's quota instead of Claude's. Claude stays the orchestrator. See [`integrations/claude-code/`](integrations/claude-code/) for a skill, a subagent, and an optional MCP tool, plus a one-command installer.
+Put those seats to work: Claude Code (terminal or the Desktop Code tab) can hand a self-contained slice to `cursor-agent`, which runs it on the Cursor subscription's quota instead of Claude's. Claude stays the orchestrator. That lives in its own plugin now, [cursor-delegate](https://github.com/smk-labs/claude-plugins/tree/main/plugins/cursor-delegate): `/plugin install cursor-delegate@smk`. It reads the same `~/.claude-deck/cursor/agent-keys.json` this dashboard uses.
 
 This is **agent calling, not a model-backend swap**: Cursor sells no Anthropic-shaped API for its subscription, and the Desktop Code tab always uses your claude.ai account, so you can't point Claude's engine at Cursor. You can run the two side by side, which is what this does.
 
