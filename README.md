@@ -60,7 +60,9 @@ Open `http://localhost:8965` to see the dashboard.
 | `claude-deck open <name> [org-uuid]` | Launch Claude with that profile, or focus its window if already running. An org UUID (macOS only) switches to that org first, but only on a fresh launch — an already-running profile is always just focused, org untouched. |
 | `claude-deck list` | List known profiles and their cached usage. |
 | `claude-deck cli-login <name>` | Mint a long-lived Claude Code token for one account (runs `claude setup-token`) and store it mode 600. |
-| `claude-deck cli <name> [args…]` | Run the Claude Code **CLI** as that account. Args after the name pass through to `claude`. `claude-deck cli --list` shows stored accounts. |
+| `claude-deck cli <name> [args…]` | Run the Claude Code **CLI** as that account, for one invocation. Args after the name pass through to `claude`. `claude-deck cli --list` shows stored accounts, marking the active one. |
+| `claude-deck cli-env [shell]` | Print a `ccuse` shell function that activates an account for the whole shell (and anything launched from it, VS Code included). Add `eval "$(claude-deck cli-env)"` to your rc file. |
+| `claude-deck cli-whoami` | Show which stored account the current shell is running as. |
 | `claude-deck cli-logout <name>` | Forget a stored account. Deletes claude-deck's token file only — revoke at claude.ai to kill the token itself. |
 | `claude-deck dash [port]` | Start the local dashboard (default port 8965). Repairs all profile index links first. |
 | `claude-deck stop [port]` (alias `kill`) | Stop the dashboard server and quit every running Claude instance, every profile including default. |
@@ -123,6 +125,49 @@ claude-deck cli work --resume
 claude-deck cli work -p "summarize the last 5 commits"   # print mode, for scripts
 ```
 
+### Activating an account for the whole shell (and VS Code)
+
+`claude-deck cli <name>` switches the account for **one** invocation. To set it
+for the current shell — and so for everything launched from it, including a GUI
+editor that reads its environment at startup — install the `ccuse` function:
+
+```bash
+eval "$(claude-deck cli-env)"        # once per shell, or add to your rc file
+```
+
+| Shell | Where to put it |
+|---|---|
+| zsh | `eval "$(claude-deck cli-env)"` in `~/.zshrc` |
+| bash | the same line in `~/.bashrc` or `~/.bash_profile` |
+| fish | `claude-deck cli-env fish >> ~/.config/fish/config.fish` |
+
+Then:
+
+```bash
+ccuse work            # activate for this shell; plain `claude` now uses it
+ccuse                 # list accounts, marking the active one
+ccuse --off           # back to the CLI's own default Keychain login
+claude-deck cli-whoami  # which account am I?
+```
+
+`cli-env` **prints** the function rather than installing it, because a child
+process cannot modify its parent's environment — the shell has to define it,
+which is what `eval` does. It's the same reason `nvm` and `pyenv` are shell
+functions. The POSIX output works in bash, zsh, ksh and dash; fish gets its own
+form. Neither reads a token until `ccuse` is called, so re-minting a token
+needs no change to your rc file.
+
+**VS Code.** The extension inherits the environment of whatever launched it, so
+activate the account first and launch from that shell:
+
+```bash
+ccuse work && code .
+```
+
+That window's Claude extension and integrated terminals run as `work`. Note the
+limit: a **running** window cannot be switched, because it read its environment
+at startup — change accounts with `ccuse` and relaunch.
+
 **Only the login changes.** `~/.claude` — settings, MCP servers, agents,
 `CLAUDE.md`, transcripts — stays shared across accounts, the same "shared
 account data, separate accounts" split the Desktop profiles use. That also
@@ -135,16 +180,11 @@ of what this project is for. `claude-deck cli` sets `CLAUDE_CODE_OAUTH_TOKEN`
 for one invocation instead, and passes it through the environment, never on
 the command line (argv is readable by any local process via `ps`).
 
-**VS Code.** The extension runs the same CLI, so a workspace can be pinned to
-an account through `.vscode/settings.json`:
-
-```jsonc
-{ "terminal.integrated.env.osx": { "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-…" } }
-```
-
-That covers integrated terminals only, and it puts a live credential in a file
-— **never commit it.** Reading the token out of
-`~/.claude-deck/cli-tokens/<name>.token` at shell startup is safer.
+A workspace can also be pinned to one account through `.vscode/settings.json`
+(`{ "terminal.integrated.env.osx": { "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-…" } }`),
+but that puts a live credential in a file — **never commit it**, and it breaks
+when the token is re-minted. `ccuse` is preferred: it reads the token file at
+call time and keeps the secret out of the repo entirely.
 
 ---
 

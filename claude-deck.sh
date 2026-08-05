@@ -94,6 +94,16 @@ else
   SUDO="sudo"
 fi
 
+# Name to print in help/usage text. Bare "$0" is the full path the shell was
+# invoked with, which for the installed copy is a 45-char absolute path that
+# wraps every usage line and buries the actual argument list. The installed
+# entry point is the `claude-deck` alias, so print that; fall back to the
+# real basename when the script is run directly from a checkout.
+case "$(basename "$0")" in
+  claude-deck.sh) PROG="claude-deck" ;;
+  *)              PROG="$(basename "$0")" ;;
+esac
+
 STATE_DIR="$HOME/.claude-deck"
 # Backups for an alternate --app target live in their own tree so a smoke
 # test against a scratch copy can never read from or clobber the real
@@ -787,8 +797,8 @@ cmd_patch() {
   trap - INT TERM
 
   c_green "✓ Patched. Claude now understands --profile=NAME."
-  c_dim   "Try: $0 open work   (launches a second, independent instance)"
-  c_dim   "Revert anytime with: $0 revert"
+  c_dim   "Try: $PROG open work   (launches a second, independent instance)"
+  c_dim   "Revert anytime with: $PROG revert"
 }
 
 # Spawns the just-patched $APP with a throwaway, isolated userData profile
@@ -866,7 +876,7 @@ _patch_rollback() {
     c_red "Rollback could not restore Info.plist's ElectronAsarIntegrity hash"
     c_red "(wanted $restored_hash, found $now_hash). The asar file itself was"
     c_red "restored, but the plist may still be wrong: check file permissions"
-    c_red "on $PLIST and re-run '$0 revert' by hand."
+    c_red "on $PLIST and re-run '$PROG revert' by hand."
   else
     c_yellow "App restored to its pre-patch state (untouched-equivalent). Nothing is broken."
   fi
@@ -1819,7 +1829,7 @@ cmd_dedupe() {
       --convert-vm)   convert="yes" ;;
       --seed-vm-all)  seed_all="yes" ;;
       --report)       report_only="yes" ;;
-      *)              die "Unknown option for dedupe: $arg (see: $0 --help)" ;;
+      *)              die "Unknown option for dedupe: $arg (see: $PROG --help)" ;;
     esac
   done
 
@@ -1951,7 +1961,7 @@ cmd_list() {
   fi
 
   if [ ! -s "$seen_file" ]; then
-    c_dim "No profiles found yet. Use: $0 open <name>"
+    c_dim "No profiles found yet. Use: $PROG open <name>"
     rm -f "$seen_file"
     return
   fi
@@ -2223,7 +2233,7 @@ cmd_mcp_doctor() {
   for arg in "$@"; do
     case "$arg" in
       --fix) fix="yes" ;;
-      *)     die "Unknown option for mcp-doctor: $arg (see: $0 --help)" ;;
+      *)     die "Unknown option for mcp-doctor: $arg (see: $PROG --help)" ;;
     esac
   done
 
@@ -2451,7 +2461,7 @@ cmd_watchdog() {
   case "$mode" in
     on)  cmd_watchdog_on ;;
     off) cmd_watchdog_off ;;
-    *)   die "Usage: $0 watchdog on|off" ;;
+    *)   die "Usage: $PROG watchdog on|off" ;;
   esac
 }
 
@@ -2519,7 +2529,7 @@ EOF
   c_green "✓ Watchdog enabled."
   c_dim "Whenever Claude's auto-updater replaces Info.plist, claude-deck re-patches automatically."
   c_dim "Log: $WD_LOG  (tail with: sudo tail -f $WD_LOG)"
-  c_dim "Disable with: $0 watchdog off"
+  c_dim "Disable with: $PROG watchdog off"
 }
 
 cmd_watchdog_off() {
@@ -2576,45 +2586,47 @@ Teaches Claude.app a --profile=NAME argument (separate Electron userData per
 profile = separate simultaneous logins), plus a local usage dashboard.
 
 Usage:
-  $0 patch [--force] [--verify-launch]
+  $PROG patch [--force] [--verify-launch]
                          apply the patch (idempotent; safe to re-run)
                          --verify-launch: smoke-test the launch (only allowed
                          with --app <scratch-copy>, never the real install)
-  $0 revert              restore the original Claude.app
-  $0 status              show patch state, hashes, backup info, profiles
-  $0 open [name] [org-uuid]
+  $PROG revert              restore the original Claude.app
+  $PROG status              show patch state, hashes, backup info, profiles
+  $PROG open [name] [org-uuid]
                          launch/focus a profile (no name = default profile).
                          An org-uuid only applies on a fresh launch (a
                          profile already running is just focused, org
                          untouched) and switches to that org first.
-  $0 cli-login <profile> mint a long-lived Claude Code token for one account
+  $PROG cli-login <profile> mint a long-lived Claude Code token for one account
                          (runs 'claude setup-token'; stored mode 600)
-  $0 cli <profile> [args...]
+  $PROG cli <profile> [args...]
                          run the Claude Code CLI as that account. Swaps ONLY
                          the login: ~/.claude (settings, MCP servers, agents,
                          CLAUDE.md) stays shared, same as Desktop profiles.
-                         '$0 cli --list' shows stored accounts.
-  $0 cli-logout <profile>
+                         '$PROG cli --list' shows stored accounts.
+  $PROG cli-whoami       show which stored account this shell is running as
+                         (nothing set = the CLI's own default Keychain login)
+  $PROG cli-logout <profile>
                          forget a stored account (deletes claude-deck's token
                          file only; revoke at claude.ai to kill the token)
-  $0 list                list known profiles (running? key captured?)
-  $0 dash [port]         run the local usage dashboard (default port 8965)
-  $0 stop [port]         (alias: kill) stop the dashboard server and quit
+  $PROG list                list known profiles (running? key captured?)
+  $PROG dash [port]         run the local usage dashboard (default port 8965)
+  $PROG stop [port]         (alias: kill) stop the dashboard server and quit
                          every running Claude Desktop instance, every
                          profile including default. The dashboard server
                          has no tie to Claude.app at all: quitting Claude
                          windows never stops it on its own.
-  $0 doctor              repair every profile's session-index link, report
+  $PROG doctor              repair every profile's session-index link, report
                          broken mcpServers paths, share any newly-downloaded
                          CLI/VM SDK copies, print the shared-artifact
                          inventory, check patch freshness, run claude-sync
                          if idle
-  $0 mcp-doctor [--fix]  list every mcpServers entry that names a local
+  $PROG mcp-doctor [--fix]  list every mcpServers entry that names a local
                          absolute path, across all profiles and the default
                          instance, with exists yes/no. --fix rewrites a
                          missing path to the working copy found in another
                          config (backup first, path token only, idempotent)
-  $0 dedupe [--dry-run] [--report] [--convert-vm] [--seed-vm-all]
+  $PROG dedupe [--dry-run] [--report] [--convert-vm] [--seed-vm-all]
                          stop every profile from keeping its own copy of the
                          Claude Code CLI and Cowork VM SDK (~246MB each):
                          point each profile's <version> dir at the default
@@ -2630,10 +2642,10 @@ Usage:
                                        that never opened Cowork too (free:
                                        an APFS clone costs 0 bytes until
                                        written, but plain du will show it)
-  $0 install             add 'claude-deck' shortcut to ~/.zshrc
-  $0 uninstall           remove the 'claude-deck' shortcut from ~/.zshrc
-  $0 watchdog on|off     (sudo) auto re-patch after Claude updates
-  $0 --help              this message
+  $PROG install             add 'claude-deck' shortcut to ~/.zshrc
+  $PROG uninstall           remove the 'claude-deck' shortcut from ~/.zshrc
+  $PROG watchdog on|off     (sudo) auto re-patch after Claude updates
+  $PROG --help              this message
 
 Notes:
   - patch/revert require sudo (writes into /Applications/Claude.app).
@@ -2673,13 +2685,131 @@ _cli_list_accounts() {
     c_dim "No CLI accounts stored yet. Add one with: $0 cli-login <profile>"
     return 0
   fi
+  # Mark the account this shell is currently running as, matched by hash so
+  # no token value is ever printed.
+  local active_hash=""
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    active_hash="$(printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" | shasum -a 256 | awk '{print $1}')"
+  fi
+
   local found=""
   for f in "$CLI_TOKENS_DIR"/*.token; do
     [ -f "$f" ] || continue
     found="yes"
-    printf '  %s\n' "$(basename "$f" .token)"
+    local nm; nm="$(basename "$f" .token)"
+    if [ -n "$active_hash" ] && \
+       [ "$(tr -d '\n' < "$f" | shasum -a 256 | awk '{print $1}')" = "$active_hash" ]; then
+      c_green "* $nm  (active in this shell)"
+    else
+      printf '  %s\n' "$nm"
+    fi
   done
   [ -n "$found" ] || c_dim "No CLI accounts stored yet. Add one with: $0 cli-login <profile>"
+}
+
+# Print a shell function that activates an account for the CURRENT shell (and
+# so for anything launched from it, VS Code included). `cli <name>` runs the
+# CLI as an account for one invocation; this is the "set it and leave it" half,
+# which is what a GUI editor needs since it reads its environment at startup.
+#
+# Printed rather than installed: a child process can never mutate its parent's
+# environment, so this MUST be eval'd/sourced by the shell itself. Emitting it
+# also keeps us out of the business of editing the user's rc file for a shell
+# we did not detect. POSIX function syntax, so the same text works in bash,
+# zsh, ksh and dash; fish needs the separate form below.
+cmd_cli_env() {
+  local shell_name="${1:-}"
+  if [ -z "$shell_name" ]; then
+    shell_name="$(basename "${SHELL:-sh}")"
+  fi
+
+  case "$shell_name" in
+    fish)
+      cat <<'FISHEOF'
+# claude-deck: add to ~/.config/fish/config.fish, or run once per shell
+function ccuse
+    set -l dir "$HOME/.claude-deck/cli-tokens"
+    if test (count $argv) -eq 0
+        claude-deck cli --list
+        return 0
+    end
+    if test "$argv[1]" = "--off"
+        set -e CLAUDE_CODE_OAUTH_TOKEN
+        echo "Claude account: default (macOS Keychain login)"
+        return 0
+    end
+    set -l f "$dir/$argv[1].token"
+    if not test -f "$f"
+        echo "No stored account '$argv[1]'." >&2
+        claude-deck cli --list >&2
+        return 1
+    end
+    set -gx CLAUDE_CODE_OAUTH_TOKEN (string trim (cat "$f"))
+    echo "Claude account: $argv[1]"
+end
+FISHEOF
+      ;;
+    *)
+      cat <<'SHEOF'
+# claude-deck: add to your shell's rc file (~/.zshrc, ~/.bashrc, ~/.profile),
+# or eval it once per shell:  eval "$(claude-deck cli-env)"
+ccuse() {
+  _cd_dir="$HOME/.claude-deck/cli-tokens"
+  if [ $# -eq 0 ]; then
+    claude-deck cli --list
+    return 0
+  fi
+  if [ "$1" = "--off" ] || [ "$1" = "off" ]; then
+    unset CLAUDE_CODE_OAUTH_TOKEN
+    echo "Claude account: default (macOS Keychain login)"
+    return 0
+  fi
+  if [ ! -f "$_cd_dir/$1.token" ]; then
+    echo "No stored account '$1'." >&2
+    claude-deck cli --list >&2
+    return 1
+  fi
+  CLAUDE_CODE_OAUTH_TOKEN="$(tr -d '\n' < "$_cd_dir/$1.token")"
+  export CLAUDE_CODE_OAUTH_TOKEN
+  echo "Claude account: $1"
+}
+SHEOF
+      ;;
+  esac
+}
+
+# Which account is this shell running as? Resolves the live
+# CLAUDE_CODE_OAUTH_TOKEN back to a stored account name by hash, so no token
+# value is ever printed and no network call is made. Unset means the CLI is
+# using its own default login (the macOS Keychain entry), which is what a
+# plain `claude` invocation gets.
+cmd_cli_whoami() {
+  local tok="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+
+  if [ -z "$tok" ]; then
+    c_yellow "No claude-deck account active in this shell."
+    c_dim "The CLI is using its own default login (macOS Keychain)."
+    c_dim "Run as a stored account with: $PROG cli <profile>"
+    return 0
+  fi
+
+  local want; want="$(printf '%s' "$tok" | shasum -a 256 | awk '{print $1}')"
+  if [ -d "$CLI_TOKENS_DIR" ]; then
+    for f in "$CLI_TOKENS_DIR"/*.token; do
+      [ -f "$f" ] || continue
+      # Compare against the file's contents with trailing newline stripped,
+      # since the stored file ends in one and the env value does not.
+      local got
+      got="$(tr -d '\n' < "$f" | shasum -a 256 | awk '{print $1}')"
+      if [ "$got" = "$want" ]; then
+        c_green "Active account: $(basename "$f" .token)"
+        return 0
+      fi
+    done
+  fi
+
+  c_yellow "A CLAUDE_CODE_OAUTH_TOKEN is set, but it matches no stored account."
+  c_dim "It was set outside claude-deck, or its token file has been replaced."
 }
 
 # Forget one stored CLI account. Deletes only claude-deck's own token file:
@@ -2687,7 +2817,7 @@ _cli_list_accounts() {
 # Keychain login `claude` uses by default is never touched.
 cmd_cli_logout() {
   local name="${1:-}"
-  [ -n "$name" ] || die "Usage: $0 cli-logout <profile>   ($0 cli --list to see accounts)"
+  [ -n "$name" ] || die "Usage: $PROG cli-logout <profile>   ($PROG cli --list to see accounts)"
   _validate_profile_name "$name"
 
   local tf; tf="$(_cli_token_file "$name")"
@@ -2702,7 +2832,7 @@ $(_cli_list_accounts)"
 
 cmd_cli() {
   local name="${1:-}"
-  [ -n "$name" ] || die "Usage: $0 cli <profile> [claude args...]   ($0 cli --list to see profiles)"
+  [ -n "$name" ] || die "Usage: $PROG cli <profile> [claude args...]   ($PROG cli --list to see profiles)"
 
   case "$name" in
     --list|-l)
@@ -2715,16 +2845,17 @@ cmd_cli() {
     --help|-h|help)
       cat <<EOF
 Usage:
-  $0 cli <profile> [claude args...]   run the Claude Code CLI as that account
-  $0 cli --list                       list stored accounts
-  $0 cli-login <profile>              mint + store a token for an account
-  $0 cli-logout <profile>             forget a stored account
+  $PROG cli <profile> [claude args...]   run the Claude Code CLI as that account
+  $PROG cli --list                       list stored accounts
+  $PROG cli-login <profile>              mint + store a token for an account
+  $PROG cli-whoami                       which account is active in this shell
+  $PROG cli-logout <profile>             forget a stored account
 
 Swaps ONLY the login (CLAUDE_CODE_OAUTH_TOKEN). Your ~/.claude — settings,
 MCP servers, agents, CLAUDE.md — stays shared across accounts.
 
 Args after <profile> go straight to claude, so this reaches claude's own help:
-  $0 cli <profile> --help
+  $PROG cli <profile> --help
 EOF
       return 0
       ;;
@@ -2734,7 +2865,7 @@ EOF
   shift || true
 
   local tf; tf="$(_cli_token_file "$name")"
-  [ -f "$tf" ] || die "No stored token for '$name'. Create one with: $0 cli-login $name"
+  [ -f "$tf" ] || die "No stored token for '$name'. Create one with: $PROG cli-login $name"
 
   local tok; tok="$(cat "$tf" 2>/dev/null || true)"
   [ -n "$tok" ] || die "Token file for '$name' is empty: $tf"
@@ -2751,7 +2882,7 @@ EOF
 # capture the token it prints.
 cmd_cli_login() {
   local name="${1:-}"
-  [ -n "$name" ] || die "Usage: $0 cli-login <profile>"
+  [ -n "$name" ] || die "Usage: $PROG cli-login <profile>"
   _validate_profile_name "$name"
   require_cmd claude
 
@@ -2795,7 +2926,7 @@ cmd_cli_login() {
   chmod 600 "$tf" 2>/dev/null || true
 
   c_green "✓ Stored token for '$name'."
-  c_dim "Run it with: $0 cli $name"
+  c_dim "Run it with: $PROG cli $name"
   c_dim "This is a full account credential (mode 600). Treat it like a password."
 }
 
@@ -2814,6 +2945,8 @@ case "$SUBCOMMAND" in
   cli)            cmd_cli "$@" ;;
   cli-login)      cmd_cli_login "$@" ;;
   cli-logout)     cmd_cli_logout "$@" ;;
+  cli-whoami)     cmd_cli_whoami ;;
+  cli-env)        cmd_cli_env "$@" ;;
   list)           cmd_list ;;
   dash)           cmd_dash "$@" ;;
   stop|kill)      cmd_stop "$@" ;;
