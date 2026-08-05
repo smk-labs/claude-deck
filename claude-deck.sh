@@ -242,8 +242,17 @@ asar_run() {
 # real macOS protection, confirmed independent of any sandboxing), unlike
 # `ps` or a plain `kill <pid>` (a same-UID signal-send check, unrelated to
 # argv-read permission), which both still work.
+#
+# Trailing `|| true` matters, same reason as _du_kb below: `set -o pipefail`
+# is on, and grep exits 1 when Claude ISN'T running, which is the normal,
+# expected case (patch/revert ask you to quit Claude first). Without it the
+# pipeline returns 1, and every caller assigns this via `pids="$(...)"`, so
+# -e aborted the whole script mid-run with no message at all: `patch` printed
+# "Preflight: checking asar layout..." and silently exited 1 having changed
+# nothing. Empty output IS the answer here ("nothing running"), not an error;
+# every caller already tests with [ -n "$pids" ].
 _running_claude_main_pids() {
-  ps ax -o pid,command 2>/dev/null | grep -F "Claude.app/Contents/MacOS/Claude" | grep -v grep | awk '{print $1}'
+  ps ax -o pid,command 2>/dev/null | grep -F "Claude.app/Contents/MacOS/Claude" | grep -v grep | awk '{print $1}' || true
 }
 
 quit_claude() {
@@ -2627,6 +2636,7 @@ Notes:
 EOF
 }
 
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
