@@ -2587,6 +2587,16 @@ Usage:
                          An org-uuid only applies on a fresh launch (a
                          profile already running is just focused, org
                          untouched) and switches to that org first.
+  $0 cli-login <profile> mint a long-lived Claude Code token for one account
+                         (runs 'claude setup-token'; stored mode 600)
+  $0 cli <profile> [args...]
+                         run the Claude Code CLI as that account. Swaps ONLY
+                         the login: ~/.claude (settings, MCP servers, agents,
+                         CLAUDE.md) stays shared, same as Desktop profiles.
+                         '$0 cli --list' shows stored accounts.
+  $0 cli-logout <profile>
+                         forget a stored account (deletes claude-deck's token
+                         file only; revoke at claude.ai to kill the token)
   $0 list                list known profiles (running? key captured?)
   $0 dash [port]         run the local usage dashboard (default port 8965)
   $0 stop [port]         (alias: kill) stop the dashboard server and quit
@@ -2637,6 +2647,158 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# cli: run the Claude Code CLI (and VS Code terminals) as a chosen account
+# ---------------------------------------------------------------------------
+# Deliberately account-only, NOT a second profile system. Claude Desktop
+# profiles work by pointing Electron at a separate userData dir; the CLI has
+# no userData at all — it keeps its login in the macOS Keychain (service
+# "Claude Code-credentials"), so that mechanism does not transfer.
+#
+# The CLI does honor CLAUDE_CONFIG_DIR, which would give a fully separate
+# ~/.claude per profile. We do NOT use it: this project's whole design is
+# "shared account data, separate accounts" (see CLAUDE.md), and a per-profile
+# config dir would fork settings, MCP servers, agents and CLAUDE.md as well
+# as the login, and would break claude-sync's single-directory scan.
+#
+# Instead we set CLAUDE_CODE_OAUTH_TOKEN for one invocation, which swaps ONLY
+# the authenticated account and leaves the shared ~/.claude untouched. Tokens
+# are minted by `claude setup-token` (long-lived, needs a subscription) and
+# stored one-per-profile, mode 600, alongside the Desktop session keys.
+CLI_TOKENS_DIR="$STATE_DIR/cli-tokens"
+
+_cli_token_file() { printf '%s/%s.token\n' "$CLI_TOKENS_DIR" "$1"; }
+
+_cli_list_accounts() {
+  if [ ! -d "$CLI_TOKENS_DIR" ]; then
+    c_dim "No CLI accounts stored yet. Add one with: $0 cli-login <profile>"
+    return 0
+  fi
+  local found=""
+  for f in "$CLI_TOKENS_DIR"/*.token; do
+    [ -f "$f" ] || continue
+    found="yes"
+    printf '  %s\n' "$(basename "$f" .token)"
+  done
+  [ -n "$found" ] || c_dim "No CLI accounts stored yet. Add one with: $0 cli-login <profile>"
+}
+
+# Forget one stored CLI account. Deletes only claude-deck's own token file:
+# the token stays valid upstream until it expires or is revoked, and the
+# Keychain login `claude` uses by default is never touched.
+cmd_cli_logout() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Usage: $0 cli-logout <profile>   ($0 cli --list to see accounts)"
+  _validate_profile_name "$name"
+
+  local tf; tf="$(_cli_token_file "$name")"
+  [ -f "$tf" ] || die "No stored token for '$name'. Stored accounts:
+$(_cli_list_accounts)"
+
+  rm -f "$tf" || die "Could not remove $tf"
+  c_green "✓ Forgot CLI account '$name'."
+  c_dim "The token itself may still be valid upstream: revoke it at claude.ai"
+  c_dim "(Settings → Connectors/Tokens) if you need it dead, not just unlinked."
+}
+
+cmd_cli() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Usage: $0 cli <profile> [claude args...]   ($0 cli --list to see profiles)"
+
+  case "$name" in
+    --list|-l)
+      _cli_list_accounts
+      return 0
+      ;;
+    # Own help must be handled here: without this, --help falls through to the
+    # token lookup and reports the nonsense "No stored token for '--help'".
+    # Note this shadows `claude --help`; use `claude --help` directly for that.
+    --help|-h|help)
+      cat <<EOF
+Usage:
+  $0 cli <profile> [claude args...]   run the Claude Code CLI as that account
+  $0 cli --list                       list stored accounts
+  $0 cli-login <profile>              mint + store a token for an account
+  $0 cli-logout <profile>             forget a stored account
+
+Swaps ONLY the login (CLAUDE_CODE_OAUTH_TOKEN). Your ~/.claude — settings,
+MCP servers, agents, CLAUDE.md — stays shared across accounts.
+
+Args after <profile> go straight to claude, so this reaches claude's own help:
+  $0 cli <profile> --help
+EOF
+      return 0
+      ;;
+  esac
+
+  _validate_profile_name "$name"
+  shift || true
+
+  local tf; tf="$(_cli_token_file "$name")"
+  [ -f "$tf" ] || die "No stored token for '$name'. Create one with: $0 cli-login $name"
+
+  local tok; tok="$(cat "$tf" 2>/dev/null || true)"
+  [ -n "$tok" ] || die "Token file for '$name' is empty: $tf"
+
+  require_cmd claude
+
+  # Pass the token via the environment, never on the command line: argv is
+  # world-readable via `ps` on macOS, a token is a bearer credential.
+  CLAUDE_CODE_OAUTH_TOKEN="$tok" exec claude "$@"
+}
+
+# Mint and store a long-lived token for one profile. `claude setup-token` is
+# interactive (browser login), so it runs in the foreground and we only
+# capture the token it prints.
+cmd_cli_login() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Usage: $0 cli-login <profile>"
+  _validate_profile_name "$name"
+  require_cmd claude
+
+  mkdir -p "$CLI_TOKENS_DIR" || die "Could not create $CLI_TOKENS_DIR"
+  chmod 700 "$CLI_TOKENS_DIR" 2>/dev/null || true
+
+  local tf; tf="$(_cli_token_file "$name")"
+  if [ -f "$tf" ]; then
+    printf "A token for '%s' already exists. Replace it? [y/N] " "$name"
+    local reply; read -r reply || reply=""
+    case "$reply" in
+      y|Y|yes|YES) : ;;
+      *) c_dim "Kept the existing token."; return 0 ;;
+    esac
+  fi
+
+  step "Running 'claude setup-token' — log in as the account you want '$name' to be."
+  c_dim "Note: this signs in through the browser; the token it prints is stored mode 600."
+
+  local tmp; tmp="$(mktemp)" || die "mktemp failed"
+  # Keep the interactive prompts on the terminal while still capturing stdout.
+  if ! claude setup-token 2>&1 | tee "$tmp"; then
+    rm -f "$tmp"
+    die "claude setup-token failed; nothing was stored."
+  fi
+
+  # The token is the sk-ant-… value in the output; take the last match so a
+  # preamble mentioning the format cannot win over the real one.
+  local tok
+  tok="$(grep -Eo 'sk-ant-[A-Za-z0-9_-]+' "$tmp" 2>/dev/null | tail -n 1 || true)"
+  rm -f "$tmp"
+
+  if [ -z "$tok" ]; then
+    die "Could not find a token in the output. Run 'claude setup-token' yourself, then paste it into: $tf (chmod 600)"
+  fi
+
+  local old_umask; old_umask="$(umask)"
+  umask 077
+  printf '%s\n' "$tok" > "$tf" || { umask "$old_umask"; die "Could not write $tf"; }
+  umask "$old_umask"
+  chmod 600 "$tf" 2>/dev/null || true
+
+  c_green "✓ Stored token for '$name'."
+  c_dim "Run it with: $0 cli $name"
+  c_dim "This is a full account credential (mode 600). Treat it like a password."
+}
+
 # ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
@@ -2649,6 +2811,9 @@ case "$SUBCOMMAND" in
   revert)         cmd_revert ;;
   status)         cmd_status ;;
   open)           cmd_open "$@" ;;
+  cli)            cmd_cli "$@" ;;
+  cli-login)      cmd_cli_login "$@" ;;
+  cli-logout)     cmd_cli_logout "$@" ;;
   list)           cmd_list ;;
   dash)           cmd_dash "$@" ;;
   stop|kill)      cmd_stop "$@" ;;

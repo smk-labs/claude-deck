@@ -59,6 +59,9 @@ Open `http://localhost:8965` to see the dashboard.
 | `claude-deck status` | Show patch state, hashes, backup info, known profiles. |
 | `claude-deck open <name> [org-uuid]` | Launch Claude with that profile, or focus its window if already running. An org UUID (macOS only) switches to that org first, but only on a fresh launch — an already-running profile is always just focused, org untouched. |
 | `claude-deck list` | List known profiles and their cached usage. |
+| `claude-deck cli-login <name>` | Mint a long-lived Claude Code token for one account (runs `claude setup-token`) and store it mode 600. |
+| `claude-deck cli <name> [args…]` | Run the Claude Code **CLI** as that account. Args after the name pass through to `claude`. `claude-deck cli --list` shows stored accounts. |
+| `claude-deck cli-logout <name>` | Forget a stored account. Deletes claude-deck's token file only — revoke at claude.ai to kill the token itself. |
 | `claude-deck dash [port]` | Start the local dashboard (default port 8965). Repairs all profile index links first. |
 | `claude-deck stop [port]` (alias `kill`) | Stop the dashboard server and quit every running Claude instance, every profile including default. |
 | `claude-deck doctor` | Repair every profile's session-index link, check the installed patch is current, run claude-sync if Claude is closed. |
@@ -93,6 +96,55 @@ To see Claude Code sessions **across different accounts**, use [`sync/claude-syn
 **Self-healing.** The index link no longer depends on the app patch being current: every `claude-deck open <name>` (and every open from the dashboard) repairs or creates the profile's session-index link before launching, and `claude-deck dash` repairs all profiles at startup. If something still looks off, run `claude-deck doctor`: it fixes every profile's link in one pass, tells you if the installed patch carries an outdated injection, and runs claude-sync for you when Claude is closed.
 
 > If you're updating claude-deck from an older version, run `claude-deck patch --force` once so this fix takes effect.
+
+---
+
+## Switching accounts in the Claude Code CLI
+
+The patch gives Claude **Desktop** simultaneous logins. The CLI is a separate
+program with a separate mechanism: it has no Electron `userData` to redirect,
+and keeps its login in the macOS Keychain (service `Claude Code-credentials`),
+so `--profile` means nothing to it.
+
+Instead, store a token per account once and pick one per run:
+
+```bash
+claude-deck cli-login work   # browser login, stores a token mode 600
+claude-deck cli work         # run the CLI as that account
+claude-deck cli --list       # stored accounts
+claude-deck cli-logout work  # forget one
+```
+
+Everything after the profile name goes to `claude` untouched, so this is a
+drop-in replacement for `claude` with a different identity:
+
+```bash
+claude-deck cli work --resume
+claude-deck cli work -p "summarize the last 5 commits"   # print mode, for scripts
+```
+
+**Only the login changes.** `~/.claude` — settings, MCP servers, agents,
+`CLAUDE.md`, transcripts — stays shared across accounts, the same "shared
+account data, separate accounts" split the Desktop profiles use. That also
+keeps claude-sync's single-directory scan valid.
+
+This is deliberately *not* `CLAUDE_CONFIG_DIR`. That variable does work and
+would give each account its own fully separate `~/.claude`, but it forks
+settings, MCP servers and agents along with the login, which is the opposite
+of what this project is for. `claude-deck cli` sets `CLAUDE_CODE_OAUTH_TOKEN`
+for one invocation instead, and passes it through the environment, never on
+the command line (argv is readable by any local process via `ps`).
+
+**VS Code.** The extension runs the same CLI, so a workspace can be pinned to
+an account through `.vscode/settings.json`:
+
+```jsonc
+{ "terminal.integrated.env.osx": { "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-…" } }
+```
+
+That covers integrated terminals only, and it puts a live credential in a file
+— **never commit it.** Reading the token out of
+`~/.claude-deck/cli-tokens/<name>.token` at shell startup is safer.
 
 ---
 
@@ -169,6 +221,7 @@ So the script strips those three and adds `com.apple.security.cs.disable-library
 ## Security notes
 
 - **Profile key files grant full account access.** `~/.claude-deck/profiles/*.json` holds a live session key per account, mode 600. Keep it out of backups and sync tools: in particular, do not let `claude-sync` or any dotfile sync pick up `~/.claude-deck/profiles/`.
+- **CLI tokens are long-lived account credentials.** `~/.claude-deck/cli-tokens/*.token` holds one `claude setup-token` token per account, mode 600 in a 700 dir. Unlike a session key these do not rotate on their own, so `cli-logout` only unlinks one from claude-deck — revoke it at claude.ai if you need it dead. Same rule as the profile keys: keep this directory out of backups and dotfile sync.
 - **The dashboard binds to `127.0.0.1` only** and sends your keys nowhere except `claude.ai`.
 - **The watchdog runs a root-owned copy** of itself under `/usr/local/lib/claude-deck`. A script that any user can edit must never run as root, so `watchdog on` copies it there before installing the LaunchDaemon.
 
