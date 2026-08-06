@@ -94,6 +94,16 @@ else
   SUDO="sudo"
 fi
 
+# Name to print in help/usage text. Bare "$0" is the full path the shell was
+# invoked with, which for the installed copy is a 45-char absolute path that
+# wraps every usage line and buries the actual argument list. The installed
+# entry point is the `claude-deck` alias, so print that; fall back to the
+# real basename when the script is run directly from a checkout.
+case "$(basename "$0")" in
+  claude-deck.sh) PROG="claude-deck" ;;
+  *)              PROG="$(basename "$0")" ;;
+esac
+
 STATE_DIR="$HOME/.claude-deck"
 # Backups for an alternate --app target live in their own tree so a smoke
 # test against a scratch copy can never read from or clobber the real
@@ -242,8 +252,17 @@ asar_run() {
 # real macOS protection, confirmed independent of any sandboxing), unlike
 # `ps` or a plain `kill <pid>` (a same-UID signal-send check, unrelated to
 # argv-read permission), which both still work.
+#
+# Trailing `|| true` matters, same reason as _du_kb below: `set -o pipefail`
+# is on, and grep exits 1 when Claude ISN'T running, which is the normal,
+# expected case (patch/revert ask you to quit Claude first). Without it the
+# pipeline returns 1, and every caller assigns this via `pids="$(...)"`, so
+# -e aborted the whole script mid-run with no message at all: `patch` printed
+# "Preflight: checking asar layout..." and silently exited 1 having changed
+# nothing. Empty output IS the answer here ("nothing running"), not an error;
+# every caller already tests with [ -n "$pids" ].
 _running_claude_main_pids() {
-  ps ax -o pid,command 2>/dev/null | grep -F "Claude.app/Contents/MacOS/Claude" | grep -v grep | awk '{print $1}'
+  ps ax -o pid,command 2>/dev/null | grep -F "Claude.app/Contents/MacOS/Claude" | grep -v grep | awk '{print $1}' || true
 }
 
 quit_claude() {
@@ -778,8 +797,8 @@ cmd_patch() {
   trap - INT TERM
 
   c_green "✓ Patched. Claude now understands --profile=NAME."
-  c_dim   "Try: $0 open work   (launches a second, independent instance)"
-  c_dim   "Revert anytime with: $0 revert"
+  c_dim   "Try: $PROG open work   (launches a second, independent instance)"
+  c_dim   "Revert anytime with: $PROG revert"
 }
 
 # Spawns the just-patched $APP with a throwaway, isolated userData profile
@@ -857,7 +876,7 @@ _patch_rollback() {
     c_red "Rollback could not restore Info.plist's ElectronAsarIntegrity hash"
     c_red "(wanted $restored_hash, found $now_hash). The asar file itself was"
     c_red "restored, but the plist may still be wrong: check file permissions"
-    c_red "on $PLIST and re-run '$0 revert' by hand."
+    c_red "on $PLIST and re-run '$PROG revert' by hand."
   else
     c_yellow "App restored to its pre-patch state (untouched-equivalent). Nothing is broken."
   fi
@@ -1810,7 +1829,7 @@ cmd_dedupe() {
       --convert-vm)   convert="yes" ;;
       --seed-vm-all)  seed_all="yes" ;;
       --report)       report_only="yes" ;;
-      *)              die "Unknown option for dedupe: $arg (see: $0 --help)" ;;
+      *)              die "Unknown option for dedupe: $arg (see: $PROG --help)" ;;
     esac
   done
 
@@ -1942,7 +1961,7 @@ cmd_list() {
   fi
 
   if [ ! -s "$seen_file" ]; then
-    c_dim "No profiles found yet. Use: $0 open <name>"
+    c_dim "No profiles found yet. Use: $PROG open <name>"
     rm -f "$seen_file"
     return
   fi
@@ -2214,7 +2233,7 @@ cmd_mcp_doctor() {
   for arg in "$@"; do
     case "$arg" in
       --fix) fix="yes" ;;
-      *)     die "Unknown option for mcp-doctor: $arg (see: $0 --help)" ;;
+      *)     die "Unknown option for mcp-doctor: $arg (see: $PROG --help)" ;;
     esac
   done
 
@@ -2442,7 +2461,7 @@ cmd_watchdog() {
   case "$mode" in
     on)  cmd_watchdog_on ;;
     off) cmd_watchdog_off ;;
-    *)   die "Usage: $0 watchdog on|off" ;;
+    *)   die "Usage: $PROG watchdog on|off" ;;
   esac
 }
 
@@ -2510,7 +2529,7 @@ EOF
   c_green "✓ Watchdog enabled."
   c_dim "Whenever Claude's auto-updater replaces Info.plist, claude-deck re-patches automatically."
   c_dim "Log: $WD_LOG  (tail with: sudo tail -f $WD_LOG)"
-  c_dim "Disable with: $0 watchdog off"
+  c_dim "Disable with: $PROG watchdog off"
 }
 
 cmd_watchdog_off() {
@@ -2567,35 +2586,47 @@ Teaches Claude.app a --profile=NAME argument (separate Electron userData per
 profile = separate simultaneous logins), plus a local usage dashboard.
 
 Usage:
-  $0 patch [--force] [--verify-launch]
+  $PROG patch [--force] [--verify-launch]
                          apply the patch (idempotent; safe to re-run)
                          --verify-launch: smoke-test the launch (only allowed
                          with --app <scratch-copy>, never the real install)
-  $0 revert              restore the original Claude.app
-  $0 status              show patch state, hashes, backup info, profiles
-  $0 open [name] [org-uuid]
+  $PROG revert              restore the original Claude.app
+  $PROG status              show patch state, hashes, backup info, profiles
+  $PROG open [name] [org-uuid]
                          launch/focus a profile (no name = default profile).
                          An org-uuid only applies on a fresh launch (a
                          profile already running is just focused, org
                          untouched) and switches to that org first.
-  $0 list                list known profiles (running? key captured?)
-  $0 dash [port]         run the local usage dashboard (default port 8965)
-  $0 stop [port]         (alias: kill) stop the dashboard server and quit
+  $PROG cli-login <profile> mint a long-lived Claude Code token for one account
+                         (runs 'claude setup-token'; stored mode 600)
+  $PROG cli <profile> [args...]
+                         run the Claude Code CLI as that account. Swaps ONLY
+                         the login: ~/.claude (settings, MCP servers, agents,
+                         CLAUDE.md) stays shared, same as Desktop profiles.
+                         '$PROG cli --list' shows stored accounts.
+  $PROG cli-whoami       show which stored account this shell is running as
+                         (nothing set = the CLI's own default Keychain login)
+  $PROG cli-logout <profile>
+                         forget a stored account (deletes claude-deck's token
+                         file only; revoke at claude.ai to kill the token)
+  $PROG list                list known profiles (running? key captured?)
+  $PROG dash [port]         run the local usage dashboard (default port 8965)
+  $PROG stop [port]         (alias: kill) stop the dashboard server and quit
                          every running Claude Desktop instance, every
                          profile including default. The dashboard server
                          has no tie to Claude.app at all: quitting Claude
                          windows never stops it on its own.
-  $0 doctor              repair every profile's session-index link, report
+  $PROG doctor              repair every profile's session-index link, report
                          broken mcpServers paths, share any newly-downloaded
                          CLI/VM SDK copies, print the shared-artifact
                          inventory, check patch freshness, run claude-sync
                          if idle
-  $0 mcp-doctor [--fix]  list every mcpServers entry that names a local
+  $PROG mcp-doctor [--fix]  list every mcpServers entry that names a local
                          absolute path, across all profiles and the default
                          instance, with exists yes/no. --fix rewrites a
                          missing path to the working copy found in another
                          config (backup first, path token only, idempotent)
-  $0 dedupe [--dry-run] [--report] [--convert-vm] [--seed-vm-all]
+  $PROG dedupe [--dry-run] [--report] [--convert-vm] [--seed-vm-all]
                          stop every profile from keeping its own copy of the
                          Claude Code CLI and Cowork VM SDK (~246MB each):
                          point each profile's <version> dir at the default
@@ -2611,10 +2642,10 @@ Usage:
                                        that never opened Cowork too (free:
                                        an APFS clone costs 0 bytes until
                                        written, but plain du will show it)
-  $0 install             add 'claude-deck' shortcut to ~/.zshrc
-  $0 uninstall           remove the 'claude-deck' shortcut from ~/.zshrc
-  $0 watchdog on|off     (sudo) auto re-patch after Claude updates
-  $0 --help              this message
+  $PROG install             add 'claude-deck' shortcut to ~/.zshrc
+  $PROG uninstall           remove the 'claude-deck' shortcut from ~/.zshrc
+  $PROG watchdog on|off     (sudo) auto re-patch after Claude updates
+  $PROG --help              this message
 
 Notes:
   - patch/revert require sudo (writes into /Applications/Claude.app).
@@ -2625,6 +2656,513 @@ Notes:
     hardware-key/passkey login.
   - Profile session keys are cached in: $PROFILES_DIR (mode 600)
 EOF
+}
+
+# ---------------------------------------------------------------------------
+# cli: run the Claude Code CLI (and VS Code terminals) as a chosen account
+# ---------------------------------------------------------------------------
+# Deliberately account-only, NOT a second profile system. Claude Desktop
+# profiles work by pointing Electron at a separate userData dir; the CLI has
+# no userData at all — it keeps its login in the macOS Keychain (service
+# "Claude Code-credentials"), so that mechanism does not transfer.
+#
+# The CLI does honor CLAUDE_CONFIG_DIR, which would give a fully separate
+# ~/.claude per profile. We do NOT use it: this project's whole design is
+# "shared account data, separate accounts" (see CLAUDE.md), and a per-profile
+# config dir would fork settings, MCP servers, agents and CLAUDE.md as well
+# as the login, and would break claude-sync's single-directory scan.
+#
+# Instead we set CLAUDE_CODE_OAUTH_TOKEN for one invocation, which swaps ONLY
+# the authenticated account and leaves the shared ~/.claude untouched. Tokens
+# are minted by `claude setup-token` (long-lived, needs a subscription) and
+# stored one-per-profile, mode 600, alongside the Desktop session keys.
+CLI_TOKENS_DIR="$STATE_DIR/cli-tokens"
+
+_cli_token_file() { printf '%s/%s.token\n' "$CLI_TOKENS_DIR" "$1"; }
+
+_cli_list_accounts() {
+  if [ ! -d "$CLI_TOKENS_DIR" ]; then
+    c_dim "No CLI accounts stored yet. Add one with: $0 cli-login <profile>"
+    return 0
+  fi
+  # Mark the account this shell is currently running as, matched by hash so
+  # no token value is ever printed.
+  local active_hash=""
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    active_hash="$(printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" | shasum -a 256 | awk '{print $1}')"
+  fi
+
+  local found=""
+  for f in "$CLI_TOKENS_DIR"/*.token; do
+    [ -f "$f" ] || continue
+    found="yes"
+    local nm; nm="$(basename "$f" .token)"
+    if [ -n "$active_hash" ] && \
+       [ "$(tr -d '\n' < "$f" | shasum -a 256 | awk '{print $1}')" = "$active_hash" ]; then
+      c_green "* $nm  (active in this shell)"
+    else
+      printf '  %s\n' "$nm"
+    fi
+  done
+  [ -n "$found" ] || c_dim "No CLI accounts stored yet. Add one with: $0 cli-login <profile>"
+}
+
+# ---------------------------------------------------------------------------
+# kc: swap the Keychain login itself, so a RUNNING app switches account
+# ---------------------------------------------------------------------------
+# Why this exists next to `cli`/`ccuse`: CLAUDE_CODE_OAUTH_TOKEN is read from
+# the environment, and a process's environment is fixed at launch, so it can
+# never reach an already-running VS Code extension host. The extension DOES
+# re-read the Keychain on every CLI spawn (verified in extension.js: the auth
+# path falls through to the Keychain / .credentials.json only when none of
+# CLAUDE_CONFIG_DIR, ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN is set), so
+# replacing the stored blob switches the account with no browser and no
+# restart — which is what `/login` does, minus the browser round-trip.
+#
+# The stored value is one JSON blob under service "Claude Code-credentials".
+# Its `claudeAiOauth` key holds accessToken + refreshToken + expiry + scopes:
+# self-contained, and the refresh token is good for ~30 days, so a snapshot
+# taken once keeps working until it expires. Everything else in the blob
+# (mcpOAuth server tokens, organizationUuid) is preserved verbatim.
+#
+# This is a GLOBAL switch: the Keychain holds exactly one login, so every
+# window and a plain `claude` follow it. That is inherent, not a bug.
+KC_SERVICE="Claude Code-credentials"
+KC_DIR="$STATE_DIR/kc-accounts"
+
+_kc_file() { printf '%s/%s.json\n' "$KC_DIR" "$1"; }
+
+# Read the live Keychain blob. Empty output means no entry (never logged in).
+_kc_read() { security find-generic-password -s "$KC_SERVICE" -w 2>/dev/null || true; }
+
+# The `acct` attribute of the live entry, preserved across writes so we never
+# silently reattribute the credential to a different account name.
+_kc_acct() {
+  security find-generic-password -s "$KC_SERVICE" 2>&1 \
+    | sed -n 's/.*"acct"<blob>="\(.*\)"/\1/p' | head -1 || true
+}
+
+# Fingerprint a blob by its claudeAiOauth.accessToken only, so "which account
+# is live" ignores unrelated churn in the same blob (MCP tokens rotate).
+_kc_fingerprint() {
+  "$NODE_BIN" -e '
+    let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+      try {
+        const o=JSON.parse(s);
+        const t=(o.claudeAiOauth&&o.claudeAiOauth.accessToken)||"";
+        if(!t){process.stdout.write("");return;}
+        process.stdout.write(require("crypto").createHash("sha256").update(t).digest("hex"));
+      } catch(e){process.stdout.write("");}
+    });' 2>/dev/null || true
+}
+
+# Human-readable summary of a blob: plan + when the tokens die. Never prints
+# a token value.
+_kc_describe() {
+  "$NODE_BIN" -e '
+    let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+      try {
+        const o=JSON.parse(s).claudeAiOauth||{};
+        const d=(ms)=>{ if(!ms) return "?"; const x=new Date(ms); const days=Math.round((ms-Date.now())/86400000);
+          return x.toISOString().slice(0,10)+" ("+(days<0?"EXPIRED":days+"d")+")"; };
+        process.stdout.write([o.subscriptionType||"?", "access "+d(o.expiresAt), "refresh "+d(o.refreshTokenExpiresAt)].join("  "));
+      } catch(e){process.stdout.write("unreadable");}
+    });' 2>/dev/null || true
+}
+
+cmd_kc_save() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Usage: $PROG kc-save <name>   (snapshots the CURRENT Keychain login)"
+  _validate_profile_name "$name"
+  ensure_node
+
+  local blob; blob="$(_kc_read)"
+  [ -n "$blob" ] || die "No Keychain login found (service: $KC_SERVICE). Log in first, then re-run."
+
+  # Refuse to store something that isn't a usable account credential, rather
+  # than writing a file that silently fails to switch later.
+  local fp; fp="$(printf '%s' "$blob" | _kc_fingerprint)"
+  [ -n "$fp" ] || die "The Keychain entry has no claudeAiOauth.accessToken; nothing saved."
+
+  mkdir -p "$KC_DIR" || die "Could not create $KC_DIR"
+  chmod 700 "$KC_DIR" 2>/dev/null || true
+
+  local f; f="$(_kc_file "$name")"
+  if [ -f "$f" ]; then
+    printf "Overwrite the saved credential for '%s'? [y/N] " "$name"
+    local r; read -r r || r=""
+    case "$r" in y|Y|yes|YES) : ;; *) c_dim "Kept the existing snapshot."; return 0 ;; esac
+  fi
+
+  local om; om="$(umask)"; umask 077
+  printf '%s' "$blob" > "$f" || { umask "$om"; die "Could not write $f"; }
+  umask "$om"
+  chmod 600 "$f" 2>/dev/null || true
+
+  c_green "✓ Saved '$name' — $(printf '%s' "$blob" | _kc_describe)"
+  c_dim "Switch to it any time with: $PROG kc $name"
+  c_dim "This file is a full account credential (mode 600). Treat it like a password."
+}
+
+cmd_kc() {
+  local name="${1:-}"
+  case "$name" in
+    ""|--list|-l) cmd_kc_list; return 0 ;;
+    --help|-h)
+      cat <<EOF
+Usage:
+  $PROG kc <name>         switch the Keychain login to that account (no browser)
+  $PROG kc-save <name>    snapshot the CURRENT Keychain login under a name
+  $PROG kc-list           list snapshots, marking the live one
+
+Switches the account for ALREADY-RUNNING apps: VS Code's extension re-reads
+the Keychain each time it spawns the CLI, so no restart is needed. This is a
+global switch — one Keychain login, so every window follows it.
+
+Use \`$PROG cli <name>\` / \`ccuse <name>\` instead when you want a per-shell
+account that leaves everything else alone.
+EOF
+      return 0 ;;
+  esac
+  _validate_profile_name "$name"
+  ensure_node
+
+  local f; f="$(_kc_file "$name")"
+  [ -f "$f" ] || die "No saved credential for '$name'. Snapshot one with: $PROG kc-save $name"
+
+  local want; want="$(_kc_fingerprint < "$f")"
+  [ -n "$want" ] || die "Saved file for '$name' has no usable credential: $f"
+
+  local live; live="$(_kc_read)"
+  if [ -n "$live" ]; then
+    if [ "$(printf '%s' "$live" | _kc_fingerprint)" = "$want" ]; then
+      c_green "Already on '$name'. Nothing to do."
+      return 0
+    fi
+    # Back up the outgoing credential before overwriting it, ALWAYS: this is
+    # the only copy of whatever is currently logged in, and if it was never
+    # snapshotted a bad swap would otherwise cost a browser re-login.
+    mkdir -p "$KC_DIR/backups" 2>/dev/null || true
+    chmod 700 "$KC_DIR/backups" 2>/dev/null || true
+    local bk="$KC_DIR/backups/pre-switch-$(date +%Y%m%d-%H%M%S).json"
+    local om; om="$(umask)"; umask 077
+    printf '%s' "$live" > "$bk" 2>/dev/null || true
+    umask "$om"
+    chmod 600 "$bk" 2>/dev/null || true
+    c_dim "Previous login backed up → $bk"
+  fi
+
+  # Preserve the entry's own acct attribute when there is one; `security`
+  # requires -a, and inventing a value would reattribute the credential.
+  local acct; acct="$(_kc_acct)"
+  [ -n "$acct" ] || acct="$name"
+
+  # Getting the blob in is fiddly; three routes, and only the third works for
+  # a value this size:
+  #   -w          with no value does NOT read piped stdin. It opens an
+  #               interactive "password data for new item:" prompt and asks
+  #               for confirmation, so a redirect silently hangs waiting for
+  #               a human (hit live).
+  #   security -i reads commands from stdin, which keeps the value out of
+  #               argv, but its line buffer is far smaller than this blob's
+  #               hex (~6.8k chars): the line wraps and the tail is parsed as
+  #               a second command ('security: unknown command "6563..."').
+  #               It then leaves the entry DELETED rather than rewritten,
+  #               which is exactly why the backup above is unconditional.
+  #   -X <hex>    works. The cost is that the credential passes through argv,
+  #               where `ps` can see it for the lifetime of the call.
+  # The exposure is a few milliseconds to same-UID processes only, and the
+  # alternative is a switch that cannot work at all, so -X is what we use.
+  # Hex also keeps the JSON's quotes and braces away from shell quoting.
+  local hex; hex="$(xxd -p < "$f" | tr -d '\n')"
+  [ -n "$hex" ] || die "Could not hex-encode $f"
+  if ! security add-generic-password -s "$KC_SERVICE" -a "$acct" -U -X "$hex" 2>/dev/null; then
+    die "Could not write the Keychain entry. Restore with: $PROG kc-restore"
+  fi
+
+  # Trust nothing: read the entry back and confirm it is the account asked for.
+  local got; got="$(_kc_read | _kc_fingerprint)"
+  if [ "$got" != "$want" ]; then
+    die "Keychain write did not take effect (still a different account). Restore from $KC_DIR/backups/ if needed."
+  fi
+
+  c_green "✓ Switched to '$name' — $(_kc_describe < "$f")"
+  c_dim "Already-running Claude Code sessions pick this up on their next request."
+}
+
+# Put the most recent pre-switch backup back. Exists because a failed write
+# can leave the Keychain with NO entry at all (see the -i note above), and
+# recovering by hand means a browser re-login for an account whose only other
+# copy is that backup file.
+cmd_kc_restore() {
+  [ -d "$KC_DIR/backups" ] || die "No backups directory yet: $KC_DIR/backups"
+  local b; b="$(ls -t "$KC_DIR"/backups/*.json 2>/dev/null | head -1)"
+  [ -n "$b" ] || die "No backup files in $KC_DIR/backups"
+  ensure_node
+
+  local want; want="$(_kc_fingerprint < "$b")"
+  [ -n "$want" ] || die "Backup has no usable credential: $b"
+
+  local acct; acct="$(_kc_acct)"
+  [ -n "$acct" ] || acct="restored"
+
+  local hex; hex="$(xxd -p < "$b" | tr -d '\n')"
+  if ! security add-generic-password -s "$KC_SERVICE" -a "$acct" -U -X "$hex" 2>/dev/null; then
+    die "Could not restore. The backup is intact at: $b"
+  fi
+  [ "$(_kc_read | _kc_fingerprint)" = "$want" ] || die "Restore did not take effect. Backup is intact at: $b"
+
+  c_green "✓ Restored the previous login from $(basename "$b")"
+  c_dim "$(_kc_describe < "$b")"
+}
+
+cmd_kc_list() {
+  if [ ! -d "$KC_DIR" ]; then
+    c_dim "No saved Keychain accounts yet. Snapshot the current login with: $PROG kc-save <name>"
+    return 0
+  fi
+  ensure_node
+  local live_fp=""; live_fp="$(_kc_read | _kc_fingerprint)"
+  local found=""
+  for f in "$KC_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    found="yes"
+    local nm; nm="$(basename "$f" .json)"
+    local desc; desc="$(_kc_describe < "$f")"
+    if [ -n "$live_fp" ] && [ "$(_kc_fingerprint < "$f")" = "$live_fp" ]; then
+      c_green "* $nm  (live)  $desc"
+    else
+      printf '  %s  %s\n' "$nm" "$desc"
+    fi
+  done
+  if [ -z "$found" ]; then
+    c_dim "No saved Keychain accounts yet. Snapshot the current login with: $PROG kc-save <name>"
+  elif [ -z "$live_fp" ]; then
+    c_yellow "No Keychain login is currently set."
+  fi
+}
+
+# Print a shell function that activates an account for the CURRENT shell (and
+# so for anything launched from it, VS Code included). `cli <name>` runs the
+# CLI as an account for one invocation; this is the "set it and leave it" half,
+# which is what a GUI editor needs since it reads its environment at startup.
+#
+# Printed rather than installed: a child process can never mutate its parent's
+# environment, so this MUST be eval'd/sourced by the shell itself. Emitting it
+# also keeps us out of the business of editing the user's rc file for a shell
+# we did not detect. POSIX function syntax, so the same text works in bash,
+# zsh, ksh and dash; fish needs the separate form below.
+cmd_cli_env() {
+  local shell_name="${1:-}"
+  if [ -z "$shell_name" ]; then
+    shell_name="$(basename "${SHELL:-sh}")"
+  fi
+
+  case "$shell_name" in
+    fish)
+      cat <<'FISHEOF'
+# claude-deck: add to ~/.config/fish/config.fish, or run once per shell
+function ccuse
+    set -l dir "$HOME/.claude-deck/cli-tokens"
+    if test (count $argv) -eq 0
+        claude-deck cli --list
+        return 0
+    end
+    if test "$argv[1]" = "--off"
+        set -e CLAUDE_CODE_OAUTH_TOKEN
+        echo "Claude account: default (macOS Keychain login)"
+        return 0
+    end
+    set -l f "$dir/$argv[1].token"
+    if not test -f "$f"
+        echo "No stored account '$argv[1]'." >&2
+        claude-deck cli --list >&2
+        return 1
+    end
+    set -gx CLAUDE_CODE_OAUTH_TOKEN (string trim (cat "$f"))
+    echo "Claude account: $argv[1]"
+end
+FISHEOF
+      ;;
+    *)
+      cat <<'SHEOF'
+# claude-deck: add to your shell's rc file (~/.zshrc, ~/.bashrc, ~/.profile),
+# or eval it once per shell:  eval "$(claude-deck cli-env)"
+ccuse() {
+  _cd_dir="$HOME/.claude-deck/cli-tokens"
+  if [ $# -eq 0 ]; then
+    claude-deck cli --list
+    return 0
+  fi
+  if [ "$1" = "--off" ] || [ "$1" = "off" ]; then
+    unset CLAUDE_CODE_OAUTH_TOKEN
+    echo "Claude account: default (macOS Keychain login)"
+    return 0
+  fi
+  if [ ! -f "$_cd_dir/$1.token" ]; then
+    echo "No stored account '$1'." >&2
+    claude-deck cli --list >&2
+    return 1
+  fi
+  CLAUDE_CODE_OAUTH_TOKEN="$(tr -d '\n' < "$_cd_dir/$1.token")"
+  export CLAUDE_CODE_OAUTH_TOKEN
+  echo "Claude account: $1"
+}
+SHEOF
+      ;;
+  esac
+}
+
+# Which account is this shell running as? Resolves the live
+# CLAUDE_CODE_OAUTH_TOKEN back to a stored account name by hash, so no token
+# value is ever printed and no network call is made. Unset means the CLI is
+# using its own default login (the macOS Keychain entry), which is what a
+# plain `claude` invocation gets.
+cmd_cli_whoami() {
+  local tok="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+
+  if [ -z "$tok" ]; then
+    c_yellow "No claude-deck account active in this shell."
+    c_dim "The CLI is using its own default login (macOS Keychain)."
+    c_dim "Run as a stored account with: $PROG cli <profile>"
+    return 0
+  fi
+
+  local want; want="$(printf '%s' "$tok" | shasum -a 256 | awk '{print $1}')"
+  if [ -d "$CLI_TOKENS_DIR" ]; then
+    for f in "$CLI_TOKENS_DIR"/*.token; do
+      [ -f "$f" ] || continue
+      # Compare against the file's contents with trailing newline stripped,
+      # since the stored file ends in one and the env value does not.
+      local got
+      got="$(tr -d '\n' < "$f" | shasum -a 256 | awk '{print $1}')"
+      if [ "$got" = "$want" ]; then
+        c_green "Active account: $(basename "$f" .token)"
+        return 0
+      fi
+    done
+  fi
+
+  c_yellow "A CLAUDE_CODE_OAUTH_TOKEN is set, but it matches no stored account."
+  c_dim "It was set outside claude-deck, or its token file has been replaced."
+}
+
+# Forget one stored CLI account. Deletes only claude-deck's own token file:
+# the token stays valid upstream until it expires or is revoked, and the
+# Keychain login `claude` uses by default is never touched.
+cmd_cli_logout() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Usage: $PROG cli-logout <profile>   ($PROG cli --list to see accounts)"
+  _validate_profile_name "$name"
+
+  local tf; tf="$(_cli_token_file "$name")"
+  [ -f "$tf" ] || die "No stored token for '$name'. Stored accounts:
+$(_cli_list_accounts)"
+
+  rm -f "$tf" || die "Could not remove $tf"
+  c_green "✓ Forgot CLI account '$name'."
+  c_dim "The token itself may still be valid upstream: revoke it at claude.ai"
+  c_dim "(Settings → Connectors/Tokens) if you need it dead, not just unlinked."
+}
+
+cmd_cli() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Usage: $PROG cli <profile> [claude args...]   ($PROG cli --list to see profiles)"
+
+  case "$name" in
+    --list|-l)
+      _cli_list_accounts
+      return 0
+      ;;
+    # Own help must be handled here: without this, --help falls through to the
+    # token lookup and reports the nonsense "No stored token for '--help'".
+    # Note this shadows `claude --help`; use `claude --help` directly for that.
+    --help|-h|help)
+      cat <<EOF
+Usage:
+  $PROG cli <profile> [claude args...]   run the Claude Code CLI as that account
+  $PROG cli --list                       list stored accounts
+  $PROG cli-login <profile>              mint + store a token for an account
+  $PROG cli-whoami                       which account is active in this shell
+  $PROG cli-logout <profile>             forget a stored account
+
+Swaps ONLY the login (CLAUDE_CODE_OAUTH_TOKEN). Your ~/.claude — settings,
+MCP servers, agents, CLAUDE.md — stays shared across accounts.
+
+Args after <profile> go straight to claude, so this reaches claude's own help:
+  $PROG cli <profile> --help
+EOF
+      return 0
+      ;;
+  esac
+
+  _validate_profile_name "$name"
+  shift || true
+
+  local tf; tf="$(_cli_token_file "$name")"
+  [ -f "$tf" ] || die "No stored token for '$name'. Create one with: $PROG cli-login $name"
+
+  local tok; tok="$(cat "$tf" 2>/dev/null || true)"
+  [ -n "$tok" ] || die "Token file for '$name' is empty: $tf"
+
+  require_cmd claude
+
+  # Pass the token via the environment, never on the command line: argv is
+  # world-readable via `ps` on macOS, a token is a bearer credential.
+  CLAUDE_CODE_OAUTH_TOKEN="$tok" exec claude "$@"
+}
+
+# Mint and store a long-lived token for one profile. `claude setup-token` is
+# interactive (browser login), so it runs in the foreground and we only
+# capture the token it prints.
+cmd_cli_login() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Usage: $PROG cli-login <profile>"
+  _validate_profile_name "$name"
+  require_cmd claude
+
+  mkdir -p "$CLI_TOKENS_DIR" || die "Could not create $CLI_TOKENS_DIR"
+  chmod 700 "$CLI_TOKENS_DIR" 2>/dev/null || true
+
+  local tf; tf="$(_cli_token_file "$name")"
+  if [ -f "$tf" ]; then
+    printf "A token for '%s' already exists. Replace it? [y/N] " "$name"
+    local reply; read -r reply || reply=""
+    case "$reply" in
+      y|Y|yes|YES) : ;;
+      *) c_dim "Kept the existing token."; return 0 ;;
+    esac
+  fi
+
+  step "Running 'claude setup-token' — log in as the account you want '$name' to be."
+  c_dim "Note: this signs in through the browser; the token it prints is stored mode 600."
+
+  local tmp; tmp="$(mktemp)" || die "mktemp failed"
+  # Keep the interactive prompts on the terminal while still capturing stdout.
+  if ! claude setup-token 2>&1 | tee "$tmp"; then
+    rm -f "$tmp"
+    die "claude setup-token failed; nothing was stored."
+  fi
+
+  # The token is the sk-ant-… value in the output; take the last match so a
+  # preamble mentioning the format cannot win over the real one.
+  local tok
+  tok="$(grep -Eo 'sk-ant-[A-Za-z0-9_-]+' "$tmp" 2>/dev/null | tail -n 1 || true)"
+  rm -f "$tmp"
+
+  if [ -z "$tok" ]; then
+    die "Could not find a token in the output. Run 'claude setup-token' yourself, then paste it into: $tf (chmod 600)"
+  fi
+
+  local old_umask; old_umask="$(umask)"
+  umask 077
+  printf '%s\n' "$tok" > "$tf" || { umask "$old_umask"; die "Could not write $tf"; }
+  umask "$old_umask"
+  chmod 600 "$tf" 2>/dev/null || true
+
+  c_green "✓ Stored token for '$name'."
+  c_dim "Run it with: $PROG cli $name"
+  c_dim "This is a full account credential (mode 600). Treat it like a password."
 }
 
 # ---------------------------------------------------------------------------
@@ -2639,6 +3177,15 @@ case "$SUBCOMMAND" in
   revert)         cmd_revert ;;
   status)         cmd_status ;;
   open)           cmd_open "$@" ;;
+  cli)            cmd_cli "$@" ;;
+  cli-login)      cmd_cli_login "$@" ;;
+  cli-logout)     cmd_cli_logout "$@" ;;
+  cli-whoami)     cmd_cli_whoami ;;
+  cli-env)        cmd_cli_env "$@" ;;
+  kc)             cmd_kc "$@" ;;
+  kc-save)        cmd_kc_save "$@" ;;
+  kc-list)        cmd_kc_list ;;
+  kc-restore)     cmd_kc_restore ;;
   list)           cmd_list ;;
   dash)           cmd_dash "$@" ;;
   stop|kill)      cmd_stop "$@" ;;
