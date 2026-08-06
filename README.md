@@ -64,6 +64,10 @@ Open `http://localhost:8965` to see the dashboard.
 | `claude-deck cli-env [shell]` | Print a `ccuse` shell function that activates an account for the whole shell (and anything launched from it, VS Code included). Add `eval "$(claude-deck cli-env)"` to your rc file. |
 | `claude-deck cli-whoami` | Show which stored account the current shell is running as. |
 | `claude-deck cli-logout <name>` | Forget a stored account. Deletes claude-deck's token file only — revoke at claude.ai to kill the token itself. |
+| `claude-deck kc-save <name>` | Snapshot the **current** Keychain login under a name (full blob: access + refresh token). |
+| `claude-deck kc <name>` | Switch the Keychain login to that account. No browser, no restart — reaches already-running apps. |
+| `claude-deck kc-list` | List Keychain snapshots with plan and expiry, marking the live one. |
+| `claude-deck kc-restore` | Put the most recent pre-switch login back. |
 | `claude-deck dash [port]` | Start the local dashboard (default port 8965). Repairs all profile index links first. |
 | `claude-deck stop [port]` (alias `kill`) | Stop the dashboard server and quit every running Claude instance, every profile including default. |
 | `claude-deck doctor` | Repair every profile's session-index link, check the installed patch is current, run claude-sync if Claude is closed. |
@@ -101,92 +105,143 @@ To see Claude Code sessions **across different accounts**, use [`sync/claude-syn
 
 ---
 
-## Switching accounts in the Claude Code CLI
+## Switching Claude Code accounts
 
-The patch gives Claude **Desktop** simultaneous logins. The CLI is a separate
-program with a separate mechanism: it has no Electron `userData` to redirect,
-and keeps its login in the macOS Keychain (service `Claude Code-credentials`),
-so `--profile` means nothing to it.
+Two methods. Pick one per window — using both at once means the env var silently wins.
 
-Instead, store a token per account once and pick one per run:
+| | `kc` | `ccuse` |
+|---|---|---|
+| Switches | the Keychain login (global) | one shell (local) |
+| Reaches a **running** VS Code | **yes** | no |
+| Needs a relaunch | no | yes |
+| Needs a browser login | once per account | once per account |
+| Best for | the editor, everyday switching | terminals, scripts, CI |
 
-```bash
-claude-deck cli-login work   # browser login, stores a token mode 600
-claude-deck cli work         # run the CLI as that account
-claude-deck cli --list       # stored accounts
-claude-deck cli-logout work  # forget one
-```
+**Precedence:** `CLAUDE_CODE_OAUTH_TOKEN` (what `ccuse` sets) always beats the
+Keychain (what `kc` sets). So if a window was launched with `ccuse` active,
+`kc` cannot change it — run `ccuse --off` and relaunch once, then use `kc`.
 
-Everything after the profile name goes to `claude` untouched, so this is a
-drop-in replacement for `claude` with a different identity:
+---
 
-```bash
-claude-deck cli work --resume
-claude-deck cli work -p "summarize the last 5 commits"   # print mode, for scripts
-```
+### Method 1 — `kc`: switch a running app, no browser, no restart
 
-### Activating an account for the whole shell (and VS Code)
+Best for VS Code. The extension re-reads the Keychain every time it spawns the
+CLI, so a swap takes effect on the next request.
 
-`claude-deck cli <name>` switches the account for **one** invocation. To set it
-for the current shell — and so for everything launched from it, including a GUI
-editor that reads its environment at startup — install the `ccuse` function:
+**Setup — once per account:**
 
 ```bash
-eval "$(claude-deck cli-env)"        # once per shell, or add to your rc file
+# 1. log in as that account (browser), e.g. `claude` then /login
+# 2. snapshot the login you just got:
+claude-deck kc-save work
 ```
 
-| Shell | Where to put it |
+Repeat for each account. Snapshots hold a refresh token (~30 days), so you
+only do this again when one expires.
+
+**Daily use — no browser:**
+
+```bash
+claude-deck kc work        # switch; running apps follow on next request
+claude-deck kc-list        # snapshots, marking the live one
+claude-deck kc-restore     # put the previous login back
+```
+
+Every switch backs up the outgoing login to `kc-accounts/backups/` first, and
+verifies the write by reading it back.
+
+> **First-time VS Code setup.** If a window was launched with `ccuse` active,
+> its env var overrides `kc`. Fix it once: `ccuse --off`, quit VS Code
+> completely (Cmd-Q — closing windows is not enough), then `code .` from that
+> shell. After this, `kc` switches that window with no further restarts.
+
+---
+
+### Method 2 — `ccuse`: per-shell, for terminals and scripts
+
+Leaves everything else alone. Cannot reach an already-running window.
+
+**Setup — once per account:**
+
+```bash
+claude-deck cli-login work      # browser login, stores a token
+```
+
+**Setup — once per machine:**
+
+```bash
+eval "$(claude-deck cli-env)"   # add this line to your rc file
+```
+
+| Shell | File |
 |---|---|
-| zsh | `eval "$(claude-deck cli-env)"` in `~/.zshrc` |
-| bash | the same line in `~/.bashrc` or `~/.bash_profile` |
+| zsh | `~/.zshrc` |
+| bash | `~/.bashrc` or `~/.bash_profile` |
 | fish | `claude-deck cli-env fish >> ~/.config/fish/config.fish` |
 
-Then:
+**Daily use:**
 
 ```bash
-ccuse work            # activate for this shell; plain `claude` now uses it
-ccuse                 # list accounts, marking the active one
-ccuse --off           # back to the CLI's own default Keychain login
-claude-deck cli-whoami  # which account am I?
+ccuse work                 # this shell (and anything it launches)
+ccuse                      # list, marking the active one
+ccuse --off                # back to the Keychain login
+claude-deck cli-whoami      # which account am I?
 ```
 
-`cli-env` **prints** the function rather than installing it, because a child
-process cannot modify its parent's environment — the shell has to define it,
-which is what `eval` does. It's the same reason `nvm` and `pyenv` are shell
-functions. The POSIX output works in bash, zsh, ksh and dash; fish gets its own
-form. Neither reads a token until `ccuse` is called, so re-minting a token
-needs no change to your rc file.
+For a single command without changing your shell:
 
-**VS Code.** The extension inherits the environment of whatever launched it, so
-activate the account first and launch from that shell:
+```bash
+claude-deck cli work                       # interactive session
+claude-deck cli work -p "summarize HEAD"   # print mode, for scripts
+claude-deck cli work --resume              # any claude flag passes through
+```
+
+**VS Code with `ccuse`:** activate, then launch — the extension inherits the
+environment at startup, so it must be a fresh process:
 
 ```bash
 ccuse work && code .
 ```
 
-That window's Claude extension and integrated terminals run as `work`. Note the
-limit: a **running** window cannot be switched, because it read its environment
-at startup — change accounts with `ccuse` and relaunch.
-
-**Only the login changes.** `~/.claude` — settings, MCP servers, agents,
-`CLAUDE.md`, transcripts — stays shared across accounts, the same "shared
-account data, separate accounts" split the Desktop profiles use. That also
-keeps claude-sync's single-directory scan valid.
-
-This is deliberately *not* `CLAUDE_CONFIG_DIR`. That variable does work and
-would give each account its own fully separate `~/.claude`, but it forks
-settings, MCP servers and agents along with the login, which is the opposite
-of what this project is for. `claude-deck cli` sets `CLAUDE_CODE_OAUTH_TOKEN`
-for one invocation instead, and passes it through the environment, never on
-the command line (argv is readable by any local process via `ps`).
-
-A workspace can also be pinned to one account through `.vscode/settings.json`
-(`{ "terminal.integrated.env.osx": { "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-…" } }`),
-but that puts a live credential in a file — **never commit it**, and it breaks
-when the token is re-minted. `ccuse` is preferred: it reads the token file at
-call time and keeps the secret out of the repo entirely.
-
 ---
+
+### Which token is which
+
+- `cli-login` stores a `setup-token`: access only, **no refresh token**. Fine
+  for `ccuse`; cannot be used as a `kc` snapshot.
+- `kc-save` stores the full login blob: access **+ refresh** + scopes. This is
+  what lets a swap keep working for weeks.
+
+They are separate credentials for the same account, so having one does not give
+you the other.
+
+### Why the CLI needs its own mechanism at all
+
+The patch gives Claude **Desktop** simultaneous logins by pointing Electron's
+`userData` elsewhere. The CLI has no `userData` — its login lives in the macOS
+Keychain (service `Claude Code-credentials`), so `--profile` means nothing to
+it.
+
+Neither method touches `~/.claude`: settings, MCP servers, agents, `CLAUDE.md`
+and transcripts stay shared across accounts, the same "shared account data,
+separate accounts" split the Desktop profiles use. That also keeps claude-sync's
+single-directory scan valid.
+
+`CLAUDE_CONFIG_DIR` is deliberately **not** used. It works, and would give each
+account a fully separate `~/.claude`, but it forks settings, MCP servers and
+agents along with the login — the opposite of what this project is for.
+
+### Storage
+
+| Path | Holds |
+|---|---|
+| `~/.claude-deck/cli-tokens/*.token` | `ccuse` setup-tokens, mode 600 |
+| `~/.claude-deck/kc-accounts/*.json` | `kc` login blobs, mode 600 |
+| `~/.claude-deck/kc-accounts/backups/` | pre-switch backups |
+
+All of these are full account credentials. Keep them out of backups, dotfile
+sync and git.
+
 
 ## Cursor accounts (optional)
 

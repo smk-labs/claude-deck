@@ -2707,6 +2707,241 @@ _cli_list_accounts() {
   [ -n "$found" ] || c_dim "No CLI accounts stored yet. Add one with: $0 cli-login <profile>"
 }
 
+# ---------------------------------------------------------------------------
+# kc: swap the Keychain login itself, so a RUNNING app switches account
+# ---------------------------------------------------------------------------
+# Why this exists next to `cli`/`ccuse`: CLAUDE_CODE_OAUTH_TOKEN is read from
+# the environment, and a process's environment is fixed at launch, so it can
+# never reach an already-running VS Code extension host. The extension DOES
+# re-read the Keychain on every CLI spawn (verified in extension.js: the auth
+# path falls through to the Keychain / .credentials.json only when none of
+# CLAUDE_CONFIG_DIR, ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN is set), so
+# replacing the stored blob switches the account with no browser and no
+# restart — which is what `/login` does, minus the browser round-trip.
+#
+# The stored value is one JSON blob under service "Claude Code-credentials".
+# Its `claudeAiOauth` key holds accessToken + refreshToken + expiry + scopes:
+# self-contained, and the refresh token is good for ~30 days, so a snapshot
+# taken once keeps working until it expires. Everything else in the blob
+# (mcpOAuth server tokens, organizationUuid) is preserved verbatim.
+#
+# This is a GLOBAL switch: the Keychain holds exactly one login, so every
+# window and a plain `claude` follow it. That is inherent, not a bug.
+KC_SERVICE="Claude Code-credentials"
+KC_DIR="$STATE_DIR/kc-accounts"
+
+_kc_file() { printf '%s/%s.json\n' "$KC_DIR" "$1"; }
+
+# Read the live Keychain blob. Empty output means no entry (never logged in).
+_kc_read() { security find-generic-password -s "$KC_SERVICE" -w 2>/dev/null || true; }
+
+# The `acct` attribute of the live entry, preserved across writes so we never
+# silently reattribute the credential to a different account name.
+_kc_acct() {
+  security find-generic-password -s "$KC_SERVICE" 2>&1 \
+    | sed -n 's/.*"acct"<blob>="\(.*\)"/\1/p' | head -1 || true
+}
+
+# Fingerprint a blob by its claudeAiOauth.accessToken only, so "which account
+# is live" ignores unrelated churn in the same blob (MCP tokens rotate).
+_kc_fingerprint() {
+  "$NODE_BIN" -e '
+    let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+      try {
+        const o=JSON.parse(s);
+        const t=(o.claudeAiOauth&&o.claudeAiOauth.accessToken)||"";
+        if(!t){process.stdout.write("");return;}
+        process.stdout.write(require("crypto").createHash("sha256").update(t).digest("hex"));
+      } catch(e){process.stdout.write("");}
+    });' 2>/dev/null || true
+}
+
+# Human-readable summary of a blob: plan + when the tokens die. Never prints
+# a token value.
+_kc_describe() {
+  "$NODE_BIN" -e '
+    let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+      try {
+        const o=JSON.parse(s).claudeAiOauth||{};
+        const d=(ms)=>{ if(!ms) return "?"; const x=new Date(ms); const days=Math.round((ms-Date.now())/86400000);
+          return x.toISOString().slice(0,10)+" ("+(days<0?"EXPIRED":days+"d")+")"; };
+        process.stdout.write([o.subscriptionType||"?", "access "+d(o.expiresAt), "refresh "+d(o.refreshTokenExpiresAt)].join("  "));
+      } catch(e){process.stdout.write("unreadable");}
+    });' 2>/dev/null || true
+}
+
+cmd_kc_save() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Usage: $PROG kc-save <name>   (snapshots the CURRENT Keychain login)"
+  _validate_profile_name "$name"
+  ensure_node
+
+  local blob; blob="$(_kc_read)"
+  [ -n "$blob" ] || die "No Keychain login found (service: $KC_SERVICE). Log in first, then re-run."
+
+  # Refuse to store something that isn't a usable account credential, rather
+  # than writing a file that silently fails to switch later.
+  local fp; fp="$(printf '%s' "$blob" | _kc_fingerprint)"
+  [ -n "$fp" ] || die "The Keychain entry has no claudeAiOauth.accessToken; nothing saved."
+
+  mkdir -p "$KC_DIR" || die "Could not create $KC_DIR"
+  chmod 700 "$KC_DIR" 2>/dev/null || true
+
+  local f; f="$(_kc_file "$name")"
+  if [ -f "$f" ]; then
+    printf "Overwrite the saved credential for '%s'? [y/N] " "$name"
+    local r; read -r r || r=""
+    case "$r" in y|Y|yes|YES) : ;; *) c_dim "Kept the existing snapshot."; return 0 ;; esac
+  fi
+
+  local om; om="$(umask)"; umask 077
+  printf '%s' "$blob" > "$f" || { umask "$om"; die "Could not write $f"; }
+  umask "$om"
+  chmod 600 "$f" 2>/dev/null || true
+
+  c_green "✓ Saved '$name' — $(printf '%s' "$blob" | _kc_describe)"
+  c_dim "Switch to it any time with: $PROG kc $name"
+  c_dim "This file is a full account credential (mode 600). Treat it like a password."
+}
+
+cmd_kc() {
+  local name="${1:-}"
+  case "$name" in
+    ""|--list|-l) cmd_kc_list; return 0 ;;
+    --help|-h)
+      cat <<EOF
+Usage:
+  $PROG kc <name>         switch the Keychain login to that account (no browser)
+  $PROG kc-save <name>    snapshot the CURRENT Keychain login under a name
+  $PROG kc-list           list snapshots, marking the live one
+
+Switches the account for ALREADY-RUNNING apps: VS Code's extension re-reads
+the Keychain each time it spawns the CLI, so no restart is needed. This is a
+global switch — one Keychain login, so every window follows it.
+
+Use \`$PROG cli <name>\` / \`ccuse <name>\` instead when you want a per-shell
+account that leaves everything else alone.
+EOF
+      return 0 ;;
+  esac
+  _validate_profile_name "$name"
+  ensure_node
+
+  local f; f="$(_kc_file "$name")"
+  [ -f "$f" ] || die "No saved credential for '$name'. Snapshot one with: $PROG kc-save $name"
+
+  local want; want="$(_kc_fingerprint < "$f")"
+  [ -n "$want" ] || die "Saved file for '$name' has no usable credential: $f"
+
+  local live; live="$(_kc_read)"
+  if [ -n "$live" ]; then
+    if [ "$(printf '%s' "$live" | _kc_fingerprint)" = "$want" ]; then
+      c_green "Already on '$name'. Nothing to do."
+      return 0
+    fi
+    # Back up the outgoing credential before overwriting it, ALWAYS: this is
+    # the only copy of whatever is currently logged in, and if it was never
+    # snapshotted a bad swap would otherwise cost a browser re-login.
+    mkdir -p "$KC_DIR/backups" 2>/dev/null || true
+    chmod 700 "$KC_DIR/backups" 2>/dev/null || true
+    local bk="$KC_DIR/backups/pre-switch-$(date +%Y%m%d-%H%M%S).json"
+    local om; om="$(umask)"; umask 077
+    printf '%s' "$live" > "$bk" 2>/dev/null || true
+    umask "$om"
+    chmod 600 "$bk" 2>/dev/null || true
+    c_dim "Previous login backed up → $bk"
+  fi
+
+  # Preserve the entry's own acct attribute when there is one; `security`
+  # requires -a, and inventing a value would reattribute the credential.
+  local acct; acct="$(_kc_acct)"
+  [ -n "$acct" ] || acct="$name"
+
+  # Getting the blob in is fiddly; three routes, and only the third works for
+  # a value this size:
+  #   -w          with no value does NOT read piped stdin. It opens an
+  #               interactive "password data for new item:" prompt and asks
+  #               for confirmation, so a redirect silently hangs waiting for
+  #               a human (hit live).
+  #   security -i reads commands from stdin, which keeps the value out of
+  #               argv, but its line buffer is far smaller than this blob's
+  #               hex (~6.8k chars): the line wraps and the tail is parsed as
+  #               a second command ('security: unknown command "6563..."').
+  #               It then leaves the entry DELETED rather than rewritten,
+  #               which is exactly why the backup above is unconditional.
+  #   -X <hex>    works. The cost is that the credential passes through argv,
+  #               where `ps` can see it for the lifetime of the call.
+  # The exposure is a few milliseconds to same-UID processes only, and the
+  # alternative is a switch that cannot work at all, so -X is what we use.
+  # Hex also keeps the JSON's quotes and braces away from shell quoting.
+  local hex; hex="$(xxd -p < "$f" | tr -d '\n')"
+  [ -n "$hex" ] || die "Could not hex-encode $f"
+  if ! security add-generic-password -s "$KC_SERVICE" -a "$acct" -U -X "$hex" 2>/dev/null; then
+    die "Could not write the Keychain entry. Restore with: $PROG kc-restore"
+  fi
+
+  # Trust nothing: read the entry back and confirm it is the account asked for.
+  local got; got="$(_kc_read | _kc_fingerprint)"
+  if [ "$got" != "$want" ]; then
+    die "Keychain write did not take effect (still a different account). Restore from $KC_DIR/backups/ if needed."
+  fi
+
+  c_green "✓ Switched to '$name' — $(_kc_describe < "$f")"
+  c_dim "Already-running Claude Code sessions pick this up on their next request."
+}
+
+# Put the most recent pre-switch backup back. Exists because a failed write
+# can leave the Keychain with NO entry at all (see the -i note above), and
+# recovering by hand means a browser re-login for an account whose only other
+# copy is that backup file.
+cmd_kc_restore() {
+  [ -d "$KC_DIR/backups" ] || die "No backups directory yet: $KC_DIR/backups"
+  local b; b="$(ls -t "$KC_DIR"/backups/*.json 2>/dev/null | head -1)"
+  [ -n "$b" ] || die "No backup files in $KC_DIR/backups"
+  ensure_node
+
+  local want; want="$(_kc_fingerprint < "$b")"
+  [ -n "$want" ] || die "Backup has no usable credential: $b"
+
+  local acct; acct="$(_kc_acct)"
+  [ -n "$acct" ] || acct="restored"
+
+  local hex; hex="$(xxd -p < "$b" | tr -d '\n')"
+  if ! security add-generic-password -s "$KC_SERVICE" -a "$acct" -U -X "$hex" 2>/dev/null; then
+    die "Could not restore. The backup is intact at: $b"
+  fi
+  [ "$(_kc_read | _kc_fingerprint)" = "$want" ] || die "Restore did not take effect. Backup is intact at: $b"
+
+  c_green "✓ Restored the previous login from $(basename "$b")"
+  c_dim "$(_kc_describe < "$b")"
+}
+
+cmd_kc_list() {
+  if [ ! -d "$KC_DIR" ]; then
+    c_dim "No saved Keychain accounts yet. Snapshot the current login with: $PROG kc-save <name>"
+    return 0
+  fi
+  ensure_node
+  local live_fp=""; live_fp="$(_kc_read | _kc_fingerprint)"
+  local found=""
+  for f in "$KC_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    found="yes"
+    local nm; nm="$(basename "$f" .json)"
+    local desc; desc="$(_kc_describe < "$f")"
+    if [ -n "$live_fp" ] && [ "$(_kc_fingerprint < "$f")" = "$live_fp" ]; then
+      c_green "* $nm  (live)  $desc"
+    else
+      printf '  %s  %s\n' "$nm" "$desc"
+    fi
+  done
+  if [ -z "$found" ]; then
+    c_dim "No saved Keychain accounts yet. Snapshot the current login with: $PROG kc-save <name>"
+  elif [ -z "$live_fp" ]; then
+    c_yellow "No Keychain login is currently set."
+  fi
+}
+
 # Print a shell function that activates an account for the CURRENT shell (and
 # so for anything launched from it, VS Code included). `cli <name>` runs the
 # CLI as an account for one invocation; this is the "set it and leave it" half,
@@ -2947,6 +3182,10 @@ case "$SUBCOMMAND" in
   cli-logout)     cmd_cli_logout "$@" ;;
   cli-whoami)     cmd_cli_whoami ;;
   cli-env)        cmd_cli_env "$@" ;;
+  kc)             cmd_kc "$@" ;;
+  kc-save)        cmd_kc_save "$@" ;;
+  kc-list)        cmd_kc_list ;;
+  kc-restore)     cmd_kc_restore ;;
   list)           cmd_list ;;
   dash)           cmd_dash "$@" ;;
   stop|kill)      cmd_stop "$@" ;;
