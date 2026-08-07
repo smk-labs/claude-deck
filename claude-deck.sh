@@ -2110,6 +2110,25 @@ _resolve_node_for_dash() {
   DASH_NODE="$NODE_BIN"
 }
 
+_dash_pid_on_port() {
+  lsof -ti tcp:"$1" -sTCP:LISTEN 2>/dev/null | head -1
+}
+
+# True only for a node process running OUR server.js. The port is checked
+# before anything is signalled, because killing whatever happens to hold 8965
+# would be a fine way to shoot down an unrelated service.
+_pid_is_our_dashboard() {
+  ps -o command= -p "$1" 2>/dev/null | grep -q "dashboard/server\.js"
+}
+
+# `dash` always replaces a dashboard that is already up, rather than starting a
+# second one behind it. Before this, cmd_dash never looked at the port: node hit
+# EADDRINUSE and died on the spot, while the browser-opening subshell fired
+# anyway and landed on the OLD process. So a re-run looked like it worked and
+# silently kept serving whatever code that process had loaded at startup, which
+# is stale the moment `install` copies a new dashboard/ over it (a live symptom:
+# clicking Open did nothing, because the running server predated the fix). A
+# restart is free here, since the server holds no state worth keeping.
 cmd_dash() {
   local port="${1:-8965}"
   _repair_all_profiles quiet
@@ -2120,8 +2139,41 @@ cmd_dash() {
   local server_js="$script_dir/dashboard/server.js"
   [ -f "$server_js" ] || die "dashboard/server.js not found next to this script ($script_dir)."
 
+  local existing waited
+  existing="$(_dash_pid_on_port "$port")"
+  if [ -n "$existing" ]; then
+    if _pid_is_our_dashboard "$existing"; then
+      step "Replacing the dashboard already on port $port (pid $existing)..."
+      kill "$existing" 2>/dev/null || true
+      waited=0
+      while [ -n "$(_dash_pid_on_port "$port")" ] && [ "$waited" -lt 20 ]; do
+        sleep 0.25
+        waited=$((waited + 1))
+      done
+      if [ -n "$(_dash_pid_on_port "$port")" ]; then
+        c_dim "  it ignored SIGTERM, forcing."
+        kill -9 "$existing" 2>/dev/null || true
+        sleep 1
+      fi
+      [ -z "$(_dash_pid_on_port "$port")" ] || die "Port $port is still held by pid $existing; could not free it."
+    else
+      die "Port $port is held by something that is not the claude-deck dashboard (pid $existing).
+Use a different port:  claude-deck dash <port>"
+    fi
+  fi
+
   step "Starting dashboard on http://127.0.0.1:$port ..."
-  ( sleep 1; open "http://127.0.0.1:$port" >/dev/null 2>&1 || true ) &
+  # Wait for the NEW server to actually bind before opening the browser. The
+  # old fixed `sleep 1` is what made a failed start still look successful.
+  ( waited=0
+    while [ "$waited" -lt 40 ]; do
+      if [ -n "$(_dash_pid_on_port "$port")" ]; then
+        open "http://127.0.0.1:$port" >/dev/null 2>&1 || true
+        break
+      fi
+      sleep 0.25
+      waited=$((waited + 1))
+    done ) &
   CLAUDE_DECK_PORT="$port" exec "$DASH_NODE" "$server_js"
 }
 

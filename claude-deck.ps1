@@ -1726,6 +1726,38 @@ function Cmd-Doctor {
 # dash
 # ---------------------------------------------------------------------------
 
+# Owning pid of whatever is LISTENING on the port, or $null.
+function Get-DashPidOnPort($port) {
+  try {
+    $c = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop | Select-Object -First 1
+    if ($c) { return [int]$c.OwningProcess }
+  } catch {}
+  # PS 5.1 on older builds may lack Get-NetTCPConnection; netstat is the fallback.
+  try {
+    $line = (Invoke-NativeQuiet { netstat -ano -p TCP }) | Where-Object { $_ -match "LISTENING" -and $_ -match ":$port\s" } | Select-Object -First 1
+    if ($line -and ($line -split '\s+')[-1] -match '^\d+$') { return [int]($line -split '\s+')[-1] }
+  } catch {}
+  return $null
+}
+
+# True only for a node process running OUR server.js. The port is checked
+# before anything is signalled, because killing whatever happens to hold 8965
+# would be a fine way to shoot down an unrelated service.
+function Test-PidIsOurDashboard($procId) {
+  try {
+    $cl = (Get-CimInstance Win32_Process -Filter "ProcessId = $procId" -ErrorAction Stop).CommandLine
+    return ($cl -and $cl -match 'dashboard[\\/]server\.js')
+  } catch { return $false }
+}
+
+# `dash` always replaces a dashboard that is already up, rather than starting a
+# second one behind it. Before this, Cmd-Dash never looked at the port: node hit
+# EADDRINUSE and died on the spot, while the browser opener fired anyway and
+# landed on the OLD process. So a re-run looked like it worked and silently kept
+# serving whatever code that process had loaded at startup, which is stale the
+# moment `install` copies a new dashboard\ over it. A restart is free here,
+# since the server holds no state worth keeping. Twin of cmd_dash in
+# claude-deck.sh; keep the two behaviourally identical.
 function Cmd-Dash($port) {
   if (-not $port) { $port = 8965 }
   Repair-AllProfiles -Quiet
@@ -1734,10 +1766,30 @@ function Cmd-Dash($port) {
   $serverJs = Join-Path (Join-Path $ScriptDir 'dashboard') 'server.js'
   if (-not (Test-Path $serverJs)) { Die "dashboard\server.js not found next to this script ($ScriptDir)." }
 
+  $existing = Get-DashPidOnPort $port
+  if ($existing) {
+    if (Test-PidIsOurDashboard $existing) {
+      Step "Replacing the dashboard already on port $port (pid $existing)..."
+      try { Stop-Process -Id $existing -ErrorAction Stop } catch {}
+      $waited = 0
+      while ((Get-DashPidOnPort $port) -and $waited -lt 20) { Start-Sleep -Milliseconds 250; $waited++ }
+      if (Get-DashPidOnPort $port) {
+        Note '  it ignored the stop, forcing.'
+        try { Stop-Process -Id $existing -Force -ErrorAction Stop } catch {}
+        Start-Sleep -Seconds 1
+      }
+      if (Get-DashPidOnPort $port) { Die "Port $port is still held by pid $existing; could not free it." }
+    } else {
+      Die "Port $port is held by something that is not the claude-deck dashboard (pid $existing).`nUse a different port:  claude-deck dash <port>"
+    }
+  }
+
   Step "Starting dashboard on http://127.0.0.1:$port ..."
-  # Open the browser after a beat so the server is listening first.
+  # Wait for the NEW server to actually bind before opening the browser. The
+  # old fixed one-second sleep is what made a failed start still look successful.
   Start-Process powershell -WindowStyle Hidden -ArgumentList @(
-    '-NoProfile', '-Command', "Start-Sleep 1; Start-Process 'http://127.0.0.1:$port'"
+    '-NoProfile', '-Command',
+    "for (`$i = 0; `$i -lt 40; `$i++) { if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { Start-Process 'http://127.0.0.1:$port'; break }; Start-Sleep -Milliseconds 250 }"
   )
   $env:CLAUDE_DECK_PORT = "$port"
   & $script:NodeBin $serverJs
