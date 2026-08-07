@@ -181,17 +181,31 @@ function listProfileNames(running) {
 // fix, and everything downstream (usage, hasKey, the cached org list,
 // `claude-deck list`) keeps working unchanged.
 const KEY_PROBE_MS = 60 * 1000;
-const KEY_PROBE_AT = new Map(); // name -> last probe time, successful or not
+const KEY_PROBE_AT = new Map(); // name -> { at, mtimeMs } of the last probe
 
-function keyFromCookies(name) {
+function profileUserDataDirFor(name) {
   if (name === 'default') {
     // The flag-less instance uses the app's own userData dir, not a profile dir.
-    const base = IS_WIN
+    return IS_WIN
       ? path.join(profilesUserDataRoot(), 'default')
       : path.join(os.homedir(), 'Library', 'Application Support', 'Claude');
-    return cookieCrypto.readSessionKey(base);
   }
-  return cookieCrypto.readSessionKey(profileUserDataDir(name));
+  return profileUserDataDir(name);
+}
+
+function keyFromCookies(name) {
+  return cookieCrypto.readSessionKey(profileUserDataDirFor(name));
+}
+
+// mtime of the profile's own cookie store, or 0 when it has none. Signing in
+// always writes that file, so a changed mtime is the cheap, exact signal that
+// this profile is worth decrypting again: a stat instead of a sqlite3 subprocess.
+function cookieStoreMtime(name) {
+  try {
+    return fs.statSync(cookieCrypto.cookiesDbFor(profileUserDataDirFor(name))).mtimeMs;
+  } catch (e) {
+    return 0;
+  }
 }
 
 // Brings each profile's stored key in line with its cookie store, throttled so
@@ -210,9 +224,17 @@ function ensureProfileKeys(names) {
   for (const name of names) {
     const filePath = path.join(PROFILES_DIR, name + '.json');
     const current = readJsonSafe(filePath);
-    const last = KEY_PROBE_AT.get(name) || 0;
-    if (Date.now() - last < KEY_PROBE_MS) continue;
-    KEY_PROBE_AT.set(name, Date.now());
+    // Skip only when the cookie store has not been touched since the last probe
+    // AND the backoff has not elapsed. A flat 60s timer here was the reason a
+    // profile the user had just signed into sat blank on the card for up to a
+    // minute: the login was on disk, nothing looked. The mtime check makes a
+    // sign-in visible on the very next poll, and the timer stays as the safety
+    // net for a profile with no cookie file at all, which is the only case
+    // where repeated probing would be pure waste.
+    const last = KEY_PROBE_AT.get(name) || { at: 0, mtimeMs: -1 };
+    const mtimeMs = cookieStoreMtime(name);
+    if (mtimeMs === last.mtimeMs && Date.now() - last.at < KEY_PROBE_MS) continue;
+    KEY_PROBE_AT.set(name, { at: Date.now(), mtimeMs });
     let key = null;
     try {
       key = keyFromCookies(name);
@@ -224,11 +246,15 @@ function ensureProfileKeys(names) {
       name,
       Object.assign({ name }, current, { sessionKey: key, updatedAt: new Date().toISOString() })
     );
-    // The cached org list belongs to whoever was logged in when it was written.
-    // A changed key can mean a different account in this profile, so drop the
-    // per-profile usage cache and let it refetch rather than render the old
-    // account's orgs against the new key.
-    if (current && current.sessionKey && current.sessionKey !== key) USAGE_CACHE.delete(name);
+    // Reaching here means the stored key just changed, so whatever is cached
+    // for this profile was computed with a different credential (or with none
+    // at all) and must not be served again. Dropping it only on a key-to-
+    // different-key change was a real bug on the path that matters most: a
+    // profile logged in from scratch goes absent -> present, kept its cached
+    // "no key" answer, and the card stayed empty for the rest of the 120s
+    // window right after the user logged in. Done for the appearing case too,
+    // so a fresh login shows up on the next poll instead of a minute later.
+    USAGE_CACHE.delete(name);
   }
 }
 
