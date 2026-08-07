@@ -26,25 +26,56 @@ const { execFileSync } = require('child_process');
 
 let SYSTEM_PROXY = undefined; // undefined = not looked up yet, null = none
 
-// macOS keeps the system proxy in the dynamic store, not in the environment, so
-// a dashboard launched from anything but a configured shell sees no env vars at
-// all. `scutil --proxy` is the same source Chromium reads.
+// Neither OS keeps the system proxy in the environment, so a dashboard launched
+// from anything but a configured shell sees no env vars at all. These read the
+// same sources the browser engine reads: the macOS dynamic store, and the
+// Windows WinINET settings the Internet Options dialog writes.
+function systemProxyMac() {
+  const out = execFileSync('scutil', ['--proxy'], { encoding: 'utf8', timeout: 5000 });
+  const field = (key) => {
+    const m = out.match(new RegExp('^\\s*' + key + '\\s*:\\s*(\\S+)\\s*$', 'm'));
+    return m ? m[1] : null;
+  };
+  // HTTPS first: every host this dashboard talks to is https.
+  if (field('HTTPSEnable') === '1' && field('HTTPSProxy')) {
+    return 'http://' + field('HTTPSProxy') + ':' + (field('HTTPSPort') || '80');
+  }
+  if (field('HTTPEnable') === '1' && field('HTTPProxy')) {
+    return 'http://' + field('HTTPProxy') + ':' + (field('HTTPPort') || '80');
+  }
+  return null;
+}
+
+function systemProxyWin() {
+  const out = execFileSync(
+    'reg',
+    ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'],
+    { encoding: 'utf8', timeout: 5000 }
+  );
+  // ProxyEnable is a REG_DWORD printed as 0x0/0x1; anything but 0 means on.
+  const en = out.match(/ProxyEnable\s+REG_DWORD\s+(\S+)/i);
+  if (!en || Number(en[1]) === 0) return null;
+  const srv = out.match(/ProxyServer\s+REG_SZ\s+(.+?)\s*$/im);
+  if (!srv) return null;
+  // Either a bare host:port for all protocols, or a per-scheme list like
+  // "http=host:8080;https=host:8443;ftp=...". Prefer the https entry.
+  const value = srv[1].trim();
+  if (value.indexOf('=') === -1) return 'http://' + value;
+  const parts = {};
+  value.split(';').forEach((pair) => {
+    const i = pair.indexOf('=');
+    if (i > 0) parts[pair.slice(0, i).trim().toLowerCase()] = pair.slice(i + 1).trim();
+  });
+  const pick = parts.https || parts.http;
+  return pick ? 'http://' + pick : null;
+}
+
 function systemProxy() {
   if (SYSTEM_PROXY !== undefined) return SYSTEM_PROXY;
   SYSTEM_PROXY = null;
-  if (process.platform !== 'darwin') return SYSTEM_PROXY;
   try {
-    const out = execFileSync('scutil', ['--proxy'], { encoding: 'utf8', timeout: 5000 });
-    const field = (key) => {
-      const m = out.match(new RegExp('^\\s*' + key + '\\s*:\\s*(\\S+)\\s*$', 'm'));
-      return m ? m[1] : null;
-    };
-    // HTTPS first: every host this dashboard talks to is https.
-    if (field('HTTPSEnable') === '1' && field('HTTPSProxy')) {
-      SYSTEM_PROXY = 'http://' + field('HTTPSProxy') + ':' + (field('HTTPSPort') || '80');
-    } else if (field('HTTPEnable') === '1' && field('HTTPProxy')) {
-      SYSTEM_PROXY = 'http://' + field('HTTPProxy') + ':' + (field('HTTPPort') || '80');
-    }
+    if (process.platform === 'darwin') SYSTEM_PROXY = systemProxyMac();
+    else if (process.platform === 'win32') SYSTEM_PROXY = systemProxyWin();
   } catch (e) {
     SYSTEM_PROXY = null;
   }
