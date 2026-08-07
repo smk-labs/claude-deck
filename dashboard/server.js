@@ -9,6 +9,7 @@ const os = require('os');
 const { execFile, spawn } = require('child_process');
 const cursor = require('./cursor.js');
 const cookieCrypto = require('./cookie-crypto.js');
+const { proxyFetch, activeProxy } = require('./proxy.js');
 
 const IS_WIN = process.platform === 'win32';
 // Port precedence: explicit CLAUDE_DECK_PORT, then a positional arg, then the
@@ -193,14 +194,22 @@ function keyFromCookies(name) {
   return cookieCrypto.readSessionKey(profileUserDataDir(name));
 }
 
-// Fills in any missing session key from the cookie store, throttled so a
-// profile that has genuinely never been logged into is not re-probed on every
+// Brings each profile's stored key in line with its cookie store, throttled so
+// a profile that has genuinely never been logged into is not re-probed on every
 // poll. Returns nothing: callers just re-read the profile JSONs afterwards.
+//
+// This deliberately refreshes a key that is merely STALE, not just one that is
+// missing. Session keys expire, so after a few weeks every stored key is dead
+// and the user logs each profile back in; on an unpatched app nothing then
+// writes the new key, and skipping any profile that already had one left the
+// dashboard quoting a July credential at an account that logged in today. The
+// cookie store is the live truth in both directions, so it wins whenever it
+// differs. A profile with no readable cookie (never launched, or migrated from
+// another machine with only its JSON) keeps the stored key untouched.
 function ensureProfileKeys(names) {
   for (const name of names) {
     const filePath = path.join(PROFILES_DIR, name + '.json');
     const current = readJsonSafe(filePath);
-    if (current && current.sessionKey) continue;
     const last = KEY_PROBE_AT.get(name) || 0;
     if (Date.now() - last < KEY_PROBE_MS) continue;
     KEY_PROBE_AT.set(name, Date.now());
@@ -210,11 +219,16 @@ function ensureProfileKeys(names) {
     } catch (e) {
       key = null;
     }
-    if (!key) continue;
+    if (!key || (current && current.sessionKey === key)) continue;
     writeProfileJson(
       name,
       Object.assign({ name }, current, { sessionKey: key, updatedAt: new Date().toISOString() })
     );
+    // The cached org list belongs to whoever was logged in when it was written.
+    // A changed key can mean a different account in this profile, so drop the
+    // per-profile usage cache and let it refetch rather than render the old
+    // account's orgs against the new key.
+    if (current && current.sessionKey && current.sessionKey !== key) USAGE_CACHE.delete(name);
   }
 }
 
@@ -402,24 +416,39 @@ function findClaudeExeWin() {
 }
 
 function fetchJson(url, cookie) {
-  return fetch(url, {
+  return proxyFetch(url, {
     headers: {
       Cookie: 'sessionKey=' + cookie,
       'User-Agent': CHROME_UA,
       Accept: 'application/json',
       Referer: 'https://claude.ai/',
     },
-  }).then(async (res) => {
-    if (res.status === 401 || res.status === 403) {
-      const e = new Error('session key expired: open this profile once and it refreshes automatically');
-      e.authError = true;
-      throw e;
+  }).then(
+    async (res) => {
+      if (res.status === 401 || res.status === 403) {
+        const e = new Error('session key expired: open this profile once and it refreshes automatically');
+        e.authError = true;
+        throw e;
+      }
+      if (!res.ok) {
+        throw new Error('request failed with status ' + res.status);
+      }
+      return res.json();
+    },
+    (e) => {
+      // A transport failure surfaces as the bare string "fetch failed", which
+      // reads like a bug in the dashboard and hides the actual cause: on this
+      // machine claude.ai is only reachable through a proxy. Name it, so the
+      // card says what to fix instead of what broke.
+      const proxy = activeProxy(url);
+      throw new Error(
+        'cannot reach claude.ai ' +
+          (proxy ? 'via proxy ' + proxy : '(no proxy configured; set HTTPS_PROXY or the macOS system proxy)') +
+          ': ' +
+          ((e && e.message) || String(e))
+      );
     }
-    if (!res.ok) {
-      throw new Error('request failed with status ' + res.status);
-    }
-    return res.json();
-  });
+  );
 }
 
 const ORGS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -1349,4 +1378,9 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log('Claude Deck dashboard listening on http://127.0.0.1:' + PORT + (MOCK ? ' (mock mode)' : ''));
+  // Node's fetch ignores every proxy setting on the machine, so on a proxied
+  // network the difference between "reaching claude.ai" and "every card empty"
+  // is invisible. Say which route this process is taking, once, at startup.
+  const proxy = activeProxy('https://claude.ai/');
+  if (proxy) console.log('Reaching claude.ai through proxy ' + proxy);
 });

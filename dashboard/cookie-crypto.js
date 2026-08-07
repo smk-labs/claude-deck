@@ -354,9 +354,51 @@ function readSessionKey(userDataDir) {
   }
 }
 
+// Deletes every claude.ai sessionKey cookie from a profile's Cookies DB.
+// Used by `claude-deck reset-auth`: a session that is still "valid" but too
+// old for elevated OAuth (session_stale_relogin) must be removed entirely,
+// because a soft "Sign in again" leaves the stale cookie in place and the
+// app latches the failure. Profile must be closed (live WAL).
+function clearSession(cookiesDb) {
+  if (!cookiesDb || !fs.existsSync(cookiesDb)) return { ok: false, reason: 'no-db' };
+
+  if (IS_WIN) {
+    const sqlite = getNodeSqlite();
+    if (!sqlite) return { ok: false, reason: 'no-sqlite' };
+    const db = new sqlite.DatabaseSync(cookiesDb);
+    try {
+      const info = db
+        .prepare(
+          "DELETE FROM cookies WHERE name = 'sessionKey' AND host_key LIKE '%claude.ai%'"
+        )
+        .run();
+      return { ok: true, deleted: Number(info.changes) || 0 };
+    } finally {
+      db.close();
+    }
+  }
+
+  // macOS: system sqlite3 CLI (same as the rest of this module).
+  try {
+    const out = require('child_process').execFileSync(
+      'sqlite3',
+      [
+        cookiesDb,
+        "DELETE FROM cookies WHERE name = 'sessionKey' AND host_key LIKE '%claude.ai%'; SELECT changes();",
+      ],
+      { encoding: 'utf8' }
+    );
+    const deleted = parseInt(String(out).trim().split(/\s+/).pop(), 10);
+    return { ok: true, deleted: Number.isFinite(deleted) ? deleted : 0 };
+  } catch (e) {
+    return { ok: false, reason: 'sqlite-cli' };
+  }
+}
+
 module.exports = {
   seedOrg,
   seedSession,
+  clearSession,
   readSessionKey,
   cookiesDbFor,
   decryptV10,
@@ -367,9 +409,29 @@ module.exports = {
 
 if (require.main === module) {
   const [, , cmd, cookiesDb, arg] = process.argv;
+  if (cmd === 'clear-session') {
+    if (!cookiesDb) {
+      console.error('usage: node cookie-crypto.js clear-session <cookiesDbPath>');
+      process.exit(1);
+    }
+    let result;
+    try {
+      result = clearSession(cookiesDb);
+    } catch (e) {
+      console.error(String((e && e.message) || e));
+      process.exit(1);
+    }
+    if (result.ok) {
+      process.stdout.write(JSON.stringify(result) + '\n');
+      process.exit(0);
+    }
+    console.error('cookie-crypto: ' + result.reason);
+    process.exit(1);
+  }
   if ((cmd !== 'seed-org' && cmd !== 'seed-session') || !cookiesDb || !arg) {
     console.error('usage: node cookie-crypto.js seed-org <cookiesDbPath> <orgUuid>');
     console.error('       node cookie-crypto.js seed-session <cookiesDbPath> <sessionKey>');
+    console.error('       node cookie-crypto.js clear-session <cookiesDbPath>');
     process.exit(1);
   }
   let result;

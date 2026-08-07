@@ -42,6 +42,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
+const { proxyFetch } = require('./proxy.js');
 
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
@@ -258,7 +259,7 @@ function userIdFromSub(sub) {
 // ---------- live usage (best effort) ----------
 
 function fetchCursorJson(url, cookie, postBody) {
-  return fetch(url, {
+  return proxyFetch(url, {
     method: postBody !== undefined ? 'POST' : 'GET',
     body: postBody,
     headers: {
@@ -404,7 +405,7 @@ function normalizeCursorUsage(raw, plan) {
 async function fetchAdminAccount(acct) {
   const auth = 'Basic ' + Buffer.from(acct.adminApiKey + ':').toString('base64');
   try {
-    const res = await fetch('https://api.cursor.com/teams/members', {
+    const res = await proxyFetch('https://api.cursor.com/teams/members', {
       headers: { Authorization: auth, Accept: 'application/json', 'User-Agent': CHROME_UA },
     });
     if (!res.ok) {

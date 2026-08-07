@@ -105,6 +105,16 @@ function Warn($m) { Write-Host $m -ForegroundColor Yellow }
 function Ok($m)   { Write-Host $m -ForegroundColor Green }
 function Die($m)  { Write-Host "[x] $m" -ForegroundColor Red; exit 1 }
 
+# Every JSON file this script writes is read back by Claude (and by node) with
+# JSON.parse, which rejects a leading BOM outright. `Set-Content -Encoding
+# UTF8` cannot be used for them: it is BOM-less on PowerShell 7 but always
+# BOM-ful on Windows PowerShell 5.1, so the same line silently produces an
+# unparseable file depending only on which host ran it.
+function Set-JsonFile($Path, $Text) {
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($Path, ($Text.TrimEnd("`r", "`n") + "`r`n"), $utf8NoBom)
+}
+
 # ---------------------------------------------------------------------------
 # app resolution
 # ---------------------------------------------------------------------------
@@ -480,7 +490,7 @@ function Sync-SshConfigs($launching) {
       if ($old -and ($old.Trim() -eq $json.Trim())) { continue }
       try {
         New-Item -ItemType Directory -Force -Path $p.Dir | Out-Null
-        Set-Content -LiteralPath $f -Value $json -Encoding UTF8
+        Set-JsonFile $f $json
         $wrote++
       } catch {}
     }
@@ -892,11 +902,50 @@ safeRun(function () {
   var mineStat = null;
   safeRun(function () { mineStat = fs.lstatSync(mine); });
 
-  if (mineStat && mineStat.isSymbolicLink()) {
-    return; // already linked, nothing to do
+  // Claude 1.25927+ refuses writes when mine itself is a reparse point
+  // (PlantDetectedError). Keep mine as a REAL directory and junction/symlink
+  // each child of shared into it.
+  function linkSharedChildren() {
+    safeRun(function () { fs.mkdirSync(mine, { recursive: true }); });
+    var kids = [];
+    safeRun(function () { kids = fs.readdirSync(shared); });
+    for (var i = 0; i < kids.length; i++) {
+      (function (name) {
+        var src = path.join(shared, name);
+        var dst = path.join(mine, name);
+        safeRun(function () {
+          if (fs.existsSync(dst)) return;
+          linkDir(src, dst);
+        });
+      })(kids[i]);
+    }
   }
 
-  if (mineStat && mineStat.isDirectory()) {
+  // A dir whose entries are ALL links is the per-child link farm this code
+  // built on an earlier launch, not a profile's own unshared index. Without
+  // this test every launch "migrates" the link farm into the shared dir it
+  // already points at and renames it aside, leaving one more
+  // claude-code-sessions.migrated-<stamp> per launch, forever. (Node reports a
+  // Windows junction as a symlink here, so one test covers both platforms.)
+  function isLinkFarm(dir) {
+    var kids = [];
+    safeRun(function () { kids = fs.readdirSync(dir); });
+    for (var i = 0; i < kids.length; i++) {
+      var st = null;
+      var kid = path.join(dir, kids[i]);
+      safeRun(function () { st = fs.lstatSync(kid); });
+      if (!st || !st.isSymbolicLink()) return false;
+    }
+    return true;
+  }
+
+  if (mineStat && mineStat.isSymbolicLink()) {
+    // Old top-level link: replace with a real dir + per-child links.
+    safeRun(function () { fs.unlinkSync(mine); });
+    mineStat = null;
+  }
+
+  if (mineStat && mineStat.isDirectory() && !isLinkFarm(mine)) {
     // Existing per-profile index: migrate its contents into the shared dir
     // additively (never overwrite a file already in shared), then keep the
     // original around as a timestamped backup instead of deleting it.
@@ -914,16 +963,14 @@ safeRun(function () {
     safeRun(function () {
       fs.renameSync(mine, mine + '.migrated-' + Date.now());
     });
-    safeRun(function () {
-      linkDir(shared, mine);
-    });
-    return;
+    mineStat = null;
   }
 
-  if (!mineStat) {
-    // Nothing at all yet for this profile: just point it at the shared dir.
-    safeRun(function () { linkDir(shared, mine); });
-  }
+  // Unconditional, and idempotent by construction: it only creates children
+  // that are missing. Running it even when the farm already exists is what
+  // links an account folder that appeared in the shared root after this
+  // profile was last converted.
+  linkSharedChildren();
 });
 
 // Manual recursive copy that skips any file/dir already present at the
@@ -1150,8 +1197,9 @@ function Validate-ProfileName($name) {
 # shell, on every open/dash, makes the fix self-healing even when the
 # installed app carries an outdated injection. Never destructive: a real
 # directory found at the link path is migrated additively and kept as a
-# timestamped backup, never deleted. Uses a junction (not a symlink) because
-# junctions need no admin rights and no Developer Mode.
+# timestamped backup, never deleted. The profile's claude-code-sessions path
+# itself must stay a real directory (Claude 1.25927+ PlantDetected); only the
+# per-account children are junctions onto the shared index.
 function Ensure-ProfileIndexLink($name) {
   $profileDir = Join-Path $ProfilesUserDataRoot $name
   $link = Join-Path $profileDir 'claude-code-sessions'
@@ -1163,22 +1211,47 @@ function Ensure-ProfileIndexLink($name) {
   New-Item -ItemType Directory -Force -Path $SharedSessionsDir | Out-Null
   New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
 
-  $item = $null
-  try { $item = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue } catch {}
-  if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-    return $true  # already linked
-  }
-
   if (Profile-Running $name) {
     Note "Profile '$name' is running: leaving its session index alone for now."
     return $false
   }
 
+  $item = $null
+  try { $item = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue } catch {}
+
+  # Claude Desktop 1.25927+ refuses writes when claude-code-sessions itself is
+  # a reparse point (PlantDetectedError: "Refusing non-directory at private
+  # dir path"). The old design made that path a junction onto the shared
+  # index; that now bricks session saves. Keep a REAL directory per profile
+  # and junction only the per-account children into the shared root.
+  if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    Step "Converting top-level session-index junction for '$name' (Claude PlantDetected)..."
+    # rmdir removes a junction without touching the shared target.
+    cmd.exe /c ('rmdir "' + $link + '"') | Out-Null
+    $item = $null
+  }
+
+  # A dir whose entries are ALL reparse points is the per-child link farm this
+  # function built on an earlier run, not a profile's own unshared index.
+  # Telling the two apart is load-bearing: without it every run "migrates" the
+  # link farm into the shared dir it already points at (a no-op copy, same
+  # files on both sides) and then renames it aside, so each launch leaves
+  # another claude-code-sessions.migrated-<stamp> behind, forever.
+  $needsMigration = $false
   if ($item -and $item.PSIsContainer) {
+    foreach ($kid in @(Get-ChildItem -LiteralPath $link -Force -ErrorAction SilentlyContinue)) {
+      if (-not ($kid.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        $needsMigration = $true
+        break
+      }
+    }
+  }
+
+  if ($item -and $item.PSIsContainer -and $needsMigration) {
     Step "Migrating existing session index for '$name' into the shared index..."
     $copied = 0
     Get-ChildItem -LiteralPath $link -Recurse -Filter 'local_*.json' -File -ErrorAction SilentlyContinue | ForEach-Object {
-      $rel = $_.FullName.Substring($link.Length).TrimStart('\', '/')
+      $rel = $_.FullName.Substring($link.Length).TrimStart([char]92, [char]47)
       $dest = Join-Path $SharedSessionsDir $rel
       if (-not (Test-Path -LiteralPath $dest)) {
         New-Item -ItemType Directory -Force -Path (Split-Path $dest -Parent) | Out-Null
@@ -1190,23 +1263,40 @@ function Ensure-ProfileIndexLink($name) {
     try {
       Rename-Item -LiteralPath $link -NewName ("claude-code-sessions.migrated-" + [DateTimeOffset]::Now.ToUnixTimeSeconds())
     } catch { Warn "Could not set aside the old index dir: $_"; return $false }
+    $item = $null
   }
 
-  try {
-    New-Item -ItemType Junction -Path $link -Target $SharedSessionsDir | Out-Null
-  } catch {
-    Warn "Could not create the session-index junction for '$name': $_"
+  New-Item -ItemType Directory -Force -Path $link | Out-Null
+
+  $linked = 0
+  Get-ChildItem -LiteralPath $SharedSessionsDir -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    # Captured because inside a catch block $_ is the ErrorRecord, not the
+    # pipeline item, and an ErrorRecord has no .Name: reaching for it there
+    # threw PropertyNotFoundStrict and took the whole launch down.
+    $child = $_
+    $dst = Join-Path $link $child.Name
+    if (Test-Path -LiteralPath $dst) { return }
+    try {
+      New-Item -ItemType Junction -Path $dst -Target $child.FullName -ErrorAction Stop | Out-Null
+      $linked++
+    } catch {
+      Warn "Could not link $($child.Name) for '$name': $_"
+    }
+  }
+  if ($linked -gt 0) { Note "  linked $linked account folder(s) into $link" }
+
+  $made = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+  if (-not ($made -and $made.PSIsContainer)) {
+    Warn "Could not materialize session-index dir for '$name'."
     return $false
   }
-  # New-Item can silently no-op in edge cases; trust the filesystem, not the
-  # absence of an exception.
-  $made = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
-  if (-not ($made -and ($made.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
-    Warn "Could not create the session-index junction for '$name'."
+  if ($made.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    Warn "Session-index for '$name' is still a reparse point; Claude will refuse writes."
     return $false
   }
   return $true
 }
+
 
 # Launch one Claude instance, profile-aware. Profiles ride the app's own
 # CLAUDE_USER_DATA_DIR hook (no patch involved): set the env var, spawn,
@@ -1355,17 +1445,18 @@ function Repair-AllProfiles([switch]$Quiet) {
     $link = Join-Path $d.FullName 'claude-code-sessions'
     $item = $null
     try { $item = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue } catch {}
-    if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-      if (-not $Quiet) { Write-Host ('  {0,-20} already-linked' -f $name) }
-      continue
-    }
     if (Profile-Running $name) {
       Write-Host ('  {0,-20} skipped-running' -f $name)
       continue
     }
-    $wasDir = ($item -and $item.PSIsContainer)
+    $wasReparse = ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint))
+    $wasDir = ($item -and $item.PSIsContainer -and -not $wasReparse)
     $okLink = Ensure-ProfileIndexLink $name
-    if ($wasDir -and $okLink) {
+    if ($wasReparse -and $okLink) {
+      Write-Host ('  {0,-20} converted-plant-safe' -f $name)
+    } elseif ($wasReparse) {
+      Write-Host ('  {0,-20} convert FAILED (see warning above)' -f $name)
+    } elseif ($wasDir -and $okLink) {
       Write-Host ('  {0,-20} migrated-and-linked' -f $name)
     } elseif ($wasDir) {
       Write-Host ('  {0,-20} migrated (but linking FAILED; see warning above)' -f $name)
@@ -1727,6 +1818,104 @@ function Cmd-Uninstall {
 # help + dispatch
 # ---------------------------------------------------------------------------
 
+function Cmd-ResetAuth($name) {
+  # Clears the latched session_stale_relogin state for one profile (or every
+  # profile when name is empty / 'all'). Claude 1.25927+ will not mint an
+  # elevated OAuth token from a session cookie that is still "valid" but too
+  # old; a soft Sign-in-again leaves that cookie in place and the failure
+  # latches. Fix: delete the sessionKey cookies, drop the dead oauth token
+  # caches, and clear the stale key from ~/.claude-deck/profiles so nothing
+  # can re-seed it. Profile must be closed. User then opens and logs in fresh.
+
+  Ensure-Node | Out-Null
+  $helper = Join-Path (Join-Path $ScriptDir 'dashboard') 'cookie-crypto.js'
+  if (-not (Test-Path $helper)) { $helper = Join-Path (Join-Path $CanonicalDir 'dashboard') 'cookie-crypto.js' }
+  if (-not (Test-Path $helper)) { Die "cookie-crypto.js not found next to this script." }
+
+  $targets = @()
+  if (-not $name -or $name -eq 'all') {
+    if (Test-Path $ProfilesUserDataRoot) {
+      $targets = @(Get-ChildItem -Path $ProfilesUserDataRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    }
+    if ($targets.Count -eq 0) { Die "No profiles found under $ProfilesUserDataRoot" }
+  } else {
+    Validate-ProfileName $name
+    $targets = @($name)
+  }
+
+  $ok = 0
+  foreach ($n in $targets) {
+    if (Profile-Running $n) {
+      Warn "Profile '$n' is running: close it first, then re-run reset-auth."
+      continue
+    }
+    $dir = if ($n -eq 'default') { $DefaultUserDataDir } else { Join-Path $ProfilesUserDataRoot $n }
+    if (-not (Test-Path $dir)) {
+      Warn "Profile '$n' has no data dir yet: skipping."
+      continue
+    }
+
+    $stamp = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+    $bakDir = Join-Path $StateDir (Join-Path 'reset-auth-backup' ($n + '-' + $stamp))
+    New-Item -ItemType Directory -Force -Path $bakDir | Out-Null
+
+    $cookies = Join-Path $dir 'Network\Cookies'
+    if (Test-Path $cookies) {
+      Copy-Item -LiteralPath $cookies -Destination (Join-Path $bakDir 'Cookies') -ErrorAction SilentlyContinue
+      Step "Clearing sessionKey cookies for '$n'..."
+      & $script:NodeBin $helper clear-session $cookies 2>&1 | ForEach-Object { Note "  $_" }
+      if ($LASTEXITCODE -ne 0) { Warn "  clear-session failed for '$n' (continuing)." }
+    } else {
+      Note "Profile '$n' has no Cookies file yet."
+    }
+
+    $cfg = Join-Path $dir 'config.json'
+    if (Test-Path $cfg) {
+      Copy-Item -LiteralPath $cfg -Destination (Join-Path $bakDir 'config.json') -ErrorAction SilentlyContinue
+      try {
+        $j = Get-Content -Raw -LiteralPath $cfg | ConvertFrom-Json
+        $changed = $false
+        foreach ($k in @('oauth:tokenCacheV2', 'oauth:tokenCache')) {
+          if ($null -ne $j.PSObject.Properties[$k]) {
+            $j.PSObject.Properties.Remove($k)
+            $changed = $true
+          }
+        }
+        if ($changed) {
+          Step "Dropping expired oauth token cache for '$n'..."
+          Set-JsonFile $cfg ($j | ConvertTo-Json -Depth 40)
+        }
+      } catch {
+        Warn "  could not edit config.json for '$n': $_"
+      }
+    }
+
+    $pj = Join-Path $ProfilesDir ($n + '.json')
+    if (Test-Path $pj) {
+      Copy-Item -LiteralPath $pj -Destination (Join-Path $bakDir ($n + '.json')) -ErrorAction SilentlyContinue
+      try {
+        $p = Get-Content -Raw -LiteralPath $pj | ConvertFrom-Json
+        if ($p.sessionKey) {
+          Step "Clearing stale sessionKey from profiles\$n.json (prevents re-seed)..."
+          $p.PSObject.Properties.Remove('sessionKey')
+          $p | Add-Member -NotePropertyName updatedAt -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+          Set-JsonFile $pj ($p | ConvertTo-Json -Depth 20)
+        }
+      } catch {
+        Warn "  could not edit profiles\$n.json: $_"
+      }
+    }
+
+    Note "  backup: $bakDir"
+    $ok++
+  }
+
+  Ok ("[OK] reset-auth done for {0} profile(s)." -f $ok)
+  Note "Next: claude-deck open <name>, sign in with real credentials (password/SSO),"
+  Note "then confirm Logs\main.log shows [oauth-v2] using cached token (no session_stale_relogin)."
+  Note "Do NOT reseed an old sessionKey from a backup - that recreates the latch."
+}
+
 function Cmd-Help {
   Write-Host @"
 claude-deck: run many Claude Desktop accounts side by side on one PC (Windows)
@@ -1748,6 +1937,10 @@ Usage:
                          focused, org untouched)
   claude-deck list       list known profiles (running? key captured?)
   claude-deck dash [port] run the local usage dashboard (default port 8965)
+  claude-deck reset-auth [name|all]
+                         clear latched stale sessions so a real login works
+                         (deletes sessionKey cookies + dead oauth caches;
+                         profile must be closed). No name = all profiles
   claude-deck doctor     repair every profile's session-index link, report
                          broken mcpServers paths, check patch freshness
   claude-deck mcp-doctor [-Fix]
@@ -1779,6 +1972,7 @@ switch ($Command) {
   'list'      { Cmd-List }
   'dash'      { Cmd-Dash $(if ($Positional.Count -gt 0) { $Positional[0] } else { '' }) }
   'doctor'     { Cmd-Doctor }
+  'reset-auth' { Cmd-ResetAuth $(if ($Positional.Count -gt 0) { $Positional[0] } else { 'all' }) }
   'mcp-doctor' { Cmd-McpDoctor }
   'install'   { Cmd-Install }
   'uninstall' { Cmd-Uninstall }

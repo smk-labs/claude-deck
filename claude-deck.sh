@@ -54,6 +54,18 @@ fi
 # sees the override transparently. When the target is user-writable we also
 # skip sudo entirely (see SUDO below) so a scratch copy never prompts.
 APP="${CLAUDE_DECK_APP:-/Applications/Claude.app}"
+
+# Always the real AppleScript runner, never whatever PATH resolves to. Found
+# live on a machine where /usr/local/bin/osascript was a 3-line wrapper that
+# ignored its arguments and exec'd a VPN tun-toggle helper; it sits ahead of
+# /usr/bin in PATH, so every osascript call in this script silently did the
+# wrong thing. `mcp-doctor` reported "could not read the configs", focusing an
+# already-running profile did nothing, and the polite quit before patch/revert
+# never ran. Same lesson as the pgrep trap: name the tool by path, do not trust
+# the lookup. Every macOS ships /usr/bin/osascript, so this cannot go missing.
+OSASCRIPT=/usr/bin/osascript
+[ -x "$OSASCRIPT" ] || OSASCRIPT=osascript
+
 _argv=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -264,7 +276,7 @@ quit_claude() {
   [ -n "$pids" ] || return 0
 
   step "Quitting Claude..."
-  osascript -e 'tell application "Claude" to quit' 2>/dev/null || true
+  "$OSASCRIPT" -e 'tell application "Claude" to quit' 2>/dev/null || true
   for _ in 1 2 3 4 5; do
     pids="$(_running_claude_main_pids)"
     [ -n "$pids" ] || break
@@ -993,11 +1005,50 @@ safeRun(function () {
   var mineStat = null;
   safeRun(function () { mineStat = fs.lstatSync(mine); });
 
-  if (mineStat && mineStat.isSymbolicLink()) {
-    return; // already linked, nothing to do
+  // Claude 1.25927+ refuses writes when mine itself is a reparse point
+  // (PlantDetectedError). Keep mine as a REAL directory and junction/symlink
+  // each child of shared into it.
+  function linkSharedChildren() {
+    safeRun(function () { fs.mkdirSync(mine, { recursive: true }); });
+    var kids = [];
+    safeRun(function () { kids = fs.readdirSync(shared); });
+    for (var i = 0; i < kids.length; i++) {
+      (function (name) {
+        var src = path.join(shared, name);
+        var dst = path.join(mine, name);
+        safeRun(function () {
+          if (fs.existsSync(dst)) return;
+          linkDir(src, dst);
+        });
+      })(kids[i]);
+    }
   }
 
-  if (mineStat && mineStat.isDirectory()) {
+  // A dir whose entries are ALL links is the per-child link farm this code
+  // built on an earlier launch, not a profile's own unshared index. Without
+  // this test every launch "migrates" the link farm into the shared dir it
+  // already points at and renames it aside, leaving one more
+  // claude-code-sessions.migrated-<stamp> per launch, forever. (Node reports a
+  // Windows junction as a symlink here, so one test covers both platforms.)
+  function isLinkFarm(dir) {
+    var kids = [];
+    safeRun(function () { kids = fs.readdirSync(dir); });
+    for (var i = 0; i < kids.length; i++) {
+      var st = null;
+      var kid = path.join(dir, kids[i]);
+      safeRun(function () { st = fs.lstatSync(kid); });
+      if (!st || !st.isSymbolicLink()) return false;
+    }
+    return true;
+  }
+
+  if (mineStat && mineStat.isSymbolicLink()) {
+    // Old top-level link: replace with a real dir + per-child links.
+    safeRun(function () { fs.unlinkSync(mine); });
+    mineStat = null;
+  }
+
+  if (mineStat && mineStat.isDirectory() && !isLinkFarm(mine)) {
     // Existing per-profile index: migrate its contents into the shared dir
     // additively (never overwrite a file already in shared), then keep the
     // original around as a timestamped backup instead of deleting it.
@@ -1015,16 +1066,14 @@ safeRun(function () {
     safeRun(function () {
       fs.renameSync(mine, mine + '.migrated-' + Date.now());
     });
-    safeRun(function () {
-      linkDir(shared, mine);
-    });
-    return;
+    mineStat = null;
   }
 
-  if (!mineStat) {
-    // Nothing at all yet for this profile: just point it at the shared dir.
-    safeRun(function () { linkDir(shared, mine); });
-  }
+  // Unconditional, and idempotent by construction: it only creates children
+  // that are missing. Running it even when the farm already exists is what
+  // links an account folder that appeared in the shared root after this
+  // profile was last converted.
+  linkSharedChildren();
 });
 
 // Manual recursive copy that skips any file/dir already present at the
@@ -1363,7 +1412,8 @@ ensure_profile_index_link() {
   mkdir -p "$shared" 2>/dev/null || true
   mkdir -p "$profile_dir" 2>/dev/null || true
 
-  if [ -L "$link" ]; then
+  # Default instance hosts the shared index physically.
+  if [ "$link" = "$shared" ]; then
     return 0
   fi
 
@@ -1372,7 +1422,29 @@ ensure_profile_index_link() {
     return 1
   fi
 
+  # Claude 1.25927+ refuses writes when claude-code-sessions itself is a
+  # symlink/junction (PlantDetectedError). Keep a REAL directory and link
+  # only the per-account children into the shared root.
+  if [ -L "$link" ]; then
+    step "Converting top-level session-index symlink for '$name' (Claude PlantDetected)..."
+    rm -f "$link" 2>/dev/null || true
+  fi
+
+  # A dir whose entries are ALL links is the per-child link farm this function
+  # built on an earlier run, not a profile's own unshared index. Telling the two
+  # apart is load-bearing: without it every run "migrates" the link farm into
+  # the shared dir it already points at (a no-op copy, source and destination
+  # are the same files) and then renames it aside, so each launch leaves another
+  # claude-code-sessions.migrated-<stamp> behind, forever.
+  local needs_migration=no entry
   if [ -d "$link" ]; then
+    for entry in "$link"/*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      if [ ! -L "$entry" ]; then needs_migration=yes; break; fi
+    done
+  fi
+
+  if [ -d "$link" ] && [ "$needs_migration" = yes ]; then
     step "Migrating existing session index for '$name' into the shared index..."
     local copied=0
     local acct_dir org_dir dest_acct_dir dest_org_dir f base
@@ -1396,15 +1468,23 @@ ensure_profile_index_link() {
     done
     c_dim "  merged $copied session file(s) into $shared"
     mv "$link" "$link.migrated-$(date +%s)" 2>/dev/null || true
-    ln -s "$shared" "$link" 2>/dev/null || true
-    return 0
   fi
 
-  # Missing (or any other non-symlink, non-dir state): just point it at the
-  # shared dir.
-  ln -s "$shared" "$link" 2>/dev/null || true
+  mkdir -p "$link" 2>/dev/null || true
+  local child
+  for child in "$shared"/*; do
+    [ -e "$child" ] || continue
+    local base dst
+    base="$(basename "$child")"
+    dst="$link/$base"
+    if [ -e "$dst" ] || [ -L "$dst" ]; then
+      continue
+    fi
+    ln -s "$child" "$dst" 2>/dev/null || true
+  done
   return 0
 }
+
 
 # ---------------------------------------------------------------------------
 # artifact sharing (claude-code / claude-code-vm version dirs, Cowork VM disk)
@@ -1861,7 +1941,7 @@ cmd_open() {
       # running default, a second instance on the same userData dir would
       # corrupt its LevelDB/session store.
       step "Focusing Claude (default profile)..."
-      osascript -e 'tell application "Claude" to activate' 2>/dev/null || true
+      "$OSASCRIPT" -e 'tell application "Claude" to activate' 2>/dev/null || true
     else
       # Default NOT running: we must force a brand-new instance with -n.
       # Plain "open -a Claude" would just activate whatever profiled instance
@@ -1886,11 +1966,11 @@ cmd_open() {
 
   if _profile_is_running "$name"; then
     step "Profile '$name' already running: focusing its window..."
-    osascript -e 'tell application "Claude" to activate' 2>/dev/null || true
+    "$OSASCRIPT" -e 'tell application "Claude" to activate' 2>/dev/null || true
     # Best-effort: raise the specific window whose title carries our tag.
     # This needs Accessibility permission for System Events; if it's not
     # granted, we silently fall back to just having activated the app above.
-    osascript <<OSA 2>/dev/null || true
+    "$OSASCRIPT" <<OSA 2>/dev/null || true
 tell application "System Events"
   tell process "Claude"
     repeat with w in windows
@@ -1987,13 +2067,14 @@ _repair_all_profiles() {
     local was_dir="no"
     [ -d "$link" ] && [ ! -L "$link" ] && was_dir="yes"
 
-    if [ "$was_symlink" = "yes" ]; then
-      [ "$verbosity" = "quiet" ] || printf "  %-20s already-linked\n" "$name"
+    if _profile_is_running "$name" 2>/dev/null; then
+      printf "  %-20s skipped-running\n" "$name"
       continue
     fi
 
-    if _profile_is_running "$name" 2>/dev/null; then
-      printf "  %-20s skipped-running\n" "$name"
+    if [ "$was_symlink" = "yes" ]; then
+      ensure_profile_index_link "$name" >/dev/null 2>&1 || true
+      printf "  %-20s converted-plant-safe\n" "$name"
       continue
     fi
 
@@ -2237,7 +2318,7 @@ cmd_mcp_doctor() {
   fi
 
   local scan
-  scan="$(osascript -l JavaScript -e "$MCP_DOCTOR_JS" scan "${targets[@]}" 2>&1)" || {
+  scan="$("$OSASCRIPT" -l JavaScript -e "$MCP_DOCTOR_JS" scan "${targets[@]}" 2>&1)" || {
     c_yellow "mcp-doctor: could not read the configs (osascript failed)."
     return 0
   }
@@ -2267,7 +2348,7 @@ $scan
 EOF_SCAN
       if [ ${#pairs[@]} -eq 0 ]; then continue; fi
       cp -p "$cfg" "$cfg.bak-mcp-path-$stamp"
-      res="$(osascript -l JavaScript -e "$MCP_DOCTOR_JS" fix "$cfg" "${pairs[@]}" 2>&1)" || res="ERR osascript failed"
+      res="$("$OSASCRIPT" -l JavaScript -e "$MCP_DOCTOR_JS" fix "$cfg" "${pairs[@]}" 2>&1)" || res="ERR osascript failed"
       case "$res" in
         OK) fixed=$((fixed + ${#pairs[@]} / 2)) ;;
         *)  c_yellow "  $label: $res; left untouched." ;;
@@ -2275,7 +2356,7 @@ EOF_SCAN
     done
     # Re-scan so the table below reports the state AFTER the repair, which is
     # also what makes a second run print a clean table with no work to do.
-    scan="$(osascript -l JavaScript -e "$MCP_DOCTOR_JS" scan "${targets[@]}" 2>&1)" || true
+    scan="$("$OSASCRIPT" -l JavaScript -e "$MCP_DOCTOR_JS" scan "${targets[@]}" 2>&1)" || true
   fi
 
   printf '%s\n' "$scan" | awk -v fixmode="$fix" -v fixed="$fixed" -F '\t' '
