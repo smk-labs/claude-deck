@@ -2188,6 +2188,121 @@ _doctor_check_injection_freshness() {
 }
 
 # ---------------------------------------------------------------------------
+# reset-auth: clear a latched stale session so a real login can happen
+# ---------------------------------------------------------------------------
+# Twin of Cmd-ResetAuth in claude-deck.ps1; keep the two behaviourally
+# identical. Since ~2026-07-08 claude.ai refuses to mint the elevated Claude
+# Code token for a session it considers stale ("Session is not fresh enough to
+# grant elevated access", session_stale_relogin) and the app LATCHES that
+# failure. Signing in again inside the app does not clear it, because the
+# still-valid stale cookie makes claude.ai skip a real credential re-auth: the
+# window comes back logged in and just as stuck. The cookie has to go first.
+# So: delete the sessionKey cookies, drop the dead oauth token caches, and
+# clear the stored key so nothing re-seeds it. Everything is backed up first,
+# a running profile is always skipped, and the user then opens and logs in.
+cmd_reset_auth() {
+  local want="${1:-all}"
+  ensure_node
+
+  local helper="$SOURCE_DIR/dashboard/cookie-crypto.js"
+  [ -f "$helper" ] || helper="$CANONICAL_DIR/dashboard/cookie-crypto.js"
+  [ -f "$helper" ] || die "cookie-crypto.js not found next to this script."
+
+  local targets="" name
+  if [ -z "$want" ] || [ "$want" = "all" ]; then
+    targets="default"
+    if [ -d "$PROFILES_USERDATA_ROOT" ]; then
+      for d in "$PROFILES_USERDATA_ROOT"/*/; do
+        [ -d "$d" ] || continue
+        targets="$targets
+$(basename "${d%/}")"
+      done
+    fi
+  else
+    _validate_profile_name "$want"
+    targets="$want"
+  fi
+
+  local stamp done_count=0
+  stamp="$(date +%s)"
+
+  printf '%s\n' "$targets" | while IFS= read -r name; do
+    [ -n "$name" ] || continue
+
+    if _profile_is_running "$name"; then
+      c_yellow "Profile '$name' is running: close it first, then re-run reset-auth."
+      continue
+    fi
+
+    local dir
+    if [ "$name" = "default" ]; then dir="$SHARED_ARTIFACT_ROOT"; else dir="$PROFILES_USERDATA_ROOT/$name"; fi
+    if [ ! -d "$dir" ]; then
+      c_dim "Profile '$name' has no data dir yet: skipping."
+      continue
+    fi
+
+    local bak="$STATE_DIR/reset-auth-backup/$name-$stamp"
+    mkdir -p "$bak" || { c_yellow "Could not create backup dir for '$name': skipping."; continue; }
+
+    local cookies="$dir/Cookies"
+    if [ -f "$cookies" ]; then
+      cp "$cookies" "$bak/Cookies" 2>/dev/null || {
+        c_yellow "Could not back up cookies for '$name': skipping (nothing changed)."
+        continue
+      }
+      step "Clearing sessionKey cookies for '$name'..."
+      "$NODE_BIN" "$helper" clear-session "$cookies" 2>&1 | while IFS= read -r l; do c_dim "  $l"; done
+    else
+      c_dim "Profile '$name' has no Cookies file yet."
+    fi
+
+    local cfg="$dir/config.json"
+    if [ -f "$cfg" ]; then
+      if cp "$cfg" "$bak/config.json" 2>/dev/null; then
+        step "Dropping expired oauth token cache for '$name'..."
+        "$NODE_BIN" -e '
+          var fs = require("fs"), p = process.argv[1];
+          try {
+            var j = JSON.parse(fs.readFileSync(p, "utf8")), changed = false;
+            ["oauth:tokenCacheV2", "oauth:tokenCache"].forEach(function (k) {
+              if (Object.prototype.hasOwnProperty.call(j, k)) { delete j[k]; changed = true; }
+            });
+            if (changed) fs.writeFileSync(p, JSON.stringify(j, null, "\t") + "\n");
+          } catch (e) { process.exit(1); }
+        ' "$cfg" || c_yellow "  could not edit config.json for '$name'"
+      else
+        c_yellow "  could not back up config.json for '$name': left it alone."
+      fi
+    fi
+
+    local pj="$PROFILES_DIR/$name.json"
+    if [ -f "$pj" ]; then
+      if cp "$pj" "$bak/$name.json" 2>/dev/null; then
+        step "Clearing stale sessionKey from profiles/$name.json (prevents re-seed)..."
+        "$NODE_BIN" -e '
+          var fs = require("fs"), p = process.argv[1];
+          try {
+            var j = JSON.parse(fs.readFileSync(p, "utf8"));
+            if (j.sessionKey) {
+              delete j.sessionKey;
+              j.updatedAt = new Date().toISOString();
+              fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n", { mode: 0o600 });
+            }
+          } catch (e) { process.exit(1); }
+        ' "$pj" || c_yellow "  could not edit profiles/$name.json"
+      else
+        c_yellow "  could not back up profiles/$name.json: left it alone."
+      fi
+    fi
+
+    c_dim "  backup: $bak"
+    done_count=$((done_count + 1))
+  done
+
+  c_green "Done. Now open each profile you reset and sign in: claude-deck open <name>"
+}
+
+# ---------------------------------------------------------------------------
 # mcp-doctor: local absolute paths in mcpServers
 # ---------------------------------------------------------------------------
 # An mcpServers entry that names a local absolute path is a CACHE of where a
@@ -2671,6 +2786,10 @@ Usage:
                          CLI/VM SDK copies, print the shared-artifact
                          inventory, check patch freshness, run claude-sync
                          if idle
+  $0 reset-auth [name|all]
+                         clear a latched stale session so a real login works
+                         (deletes sessionKey cookies + dead oauth caches,
+                         backs everything up first; profile must be closed)
   $0 mcp-doctor [--fix]  list every mcpServers entry that names a local
                          absolute path, across all profiles and the default
                          instance, with exists yes/no. --fix rewrites a
@@ -2725,6 +2844,7 @@ case "$SUBCOMMAND" in
   stop|kill)      cmd_stop "$@" ;;
   doctor)         cmd_doctor ;;
   mcp-doctor)     cmd_mcp_doctor "$@" ;;
+  reset-auth)     cmd_reset_auth "$@" ;;
   dedupe)         cmd_dedupe "$@" ;;
   install)        cmd_install ;;
   uninstall)      cmd_uninstall ;;
