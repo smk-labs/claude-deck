@@ -16,6 +16,10 @@
 //   node import-tokens-win.js <path-to-claude-deck-tokens.json> [profileName]
 //   (profileName imports just one; omit it to do all)
 //
+// The Mac's flag-less instance is exported as "(default)" and lands on the
+// profile named `default`. A bulk run always skips it, so importing it is a
+// deliberate act:  node import-tokens-win.js <file> default
+//
 const fs = require('fs');
 const path = require('path');
 const { deriveKey, encryptV10 } = require(path.join(__dirname, '..', 'dashboard', 'cookie-crypto.js'));
@@ -41,11 +45,29 @@ function profileDir(name) {
   return path.join(LEGACY_ROOT, name);
 }
 
-for (const name of Object.keys(data)) {
-  if (name === '(default)') continue;             // never overwrite the working default
+// The Mac exporter labels the flag-less instance "(default)"; on Windows that
+// is the profile dir ~\ClaudeProfiles\default, launched with
+// CLAUDE_USER_DATA_DIR like every other one. It stays out of the all-profiles
+// sweep so a bulk import can never overwrite a working default by accident,
+// but importing it IS what replicating a Mac means, so naming it explicitly
+// (`import-tokens-win.js <file> default`) does it.
+for (const label of Object.keys(data)) {
+  const name = label === '(default)' ? 'default' : label;
+  if (label === '(default)' && only !== 'default') {
+    console.log('SKIP default: not imported in a bulk run -- name it explicitly to import it');
+    continue;
+  }
   if (only && name !== only) continue;
-  const macAccount = data[name].account;
-  const macCache = data[name].cache;
+  const macAccount = data[label].account;
+  const macCache = data[label].cache;
+  // Only the escaped layout has a real ~\ClaudeProfiles\default. On a machine
+  // that has not run the one-time migration, the flag-less instance still
+  // lives in %APPDATA%\Claude, which profileDir() does NOT resolve to, so
+  // importing there would write into a dir the app never reads.
+  if (name === 'default' && !fs.existsSync(path.join(ESCAPED_ROOT, 'default'))) {
+    console.log('SKIP default: ' + path.join(ESCAPED_ROOT, 'default') + ' does not exist -- run the profile migration first, then launch default once');
+    continue;
+  }
   const ud = profileDir(name);
   const cfgP = path.join(ud, 'config.json');
   const lsP = path.join(ud, 'Local State');
