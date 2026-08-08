@@ -1268,14 +1268,23 @@ function Ensure-ProfileIndexLink($name) {
 
   New-Item -ItemType Directory -Force -Path $link | Out-Null
 
+  # foreach over a materialized array, NOT ForEach-Object over the pipeline.
+  # Two things went wrong with the pipeline form, both fatal under
+  # Set-StrictMode 2: anything reaching the block without a .Name property
+  # (a null, an error record) threw PropertyNotFoundStrict and took the whole
+  # launch down with it -- `claude-deck dash` died on this line before the
+  # dashboard ever started -- and `$linked++` inside a ForEach-Object block
+  # increments a block-local copy, so the count was always reported as 0.
   $linked = 0
-  Get-ChildItem -LiteralPath $SharedSessionsDir -Force -ErrorAction SilentlyContinue | ForEach-Object {
-    # Captured because inside a catch block $_ is the ErrorRecord, not the
-    # pipeline item, and an ErrorRecord has no .Name: reaching for it there
-    # threw PropertyNotFoundStrict and took the whole launch down.
-    $child = $_
+  $children = @()
+  try {
+    $children = @(Get-ChildItem -LiteralPath $SharedSessionsDir -Force -ErrorAction SilentlyContinue)
+  } catch { $children = @() }
+  foreach ($child in $children) {
+    if (-not $child) { continue }
+    if (-not $child.PSObject.Properties['Name']) { continue }
     $dst = Join-Path $link $child.Name
-    if (Test-Path -LiteralPath $dst) { return }
+    if (Test-Path -LiteralPath $dst) { continue }
     try {
       New-Item -ItemType Junction -Path $dst -Target $child.FullName -ErrorAction Stop | Out-Null
       $linked++
@@ -1760,7 +1769,10 @@ function Test-PidIsOurDashboard($procId) {
 # claude-deck.sh; keep the two behaviourally identical.
 function Cmd-Dash($port) {
   if (-not $port) { $port = 8965 }
-  Repair-AllProfiles -Quiet
+  # Never let session-index housekeeping stop the dashboard from starting.
+  # It is a best-effort repair of symlinks; `dash` failing because of it
+  # leaves the user with no dashboard AND no way to see what went wrong.
+  try { Repair-AllProfiles -Quiet } catch { Warn "Session-index repair failed, starting the dashboard anyway: $_" }
   Ensure-Node
 
   $serverJs = Join-Path (Join-Path $ScriptDir 'dashboard') 'server.js'
